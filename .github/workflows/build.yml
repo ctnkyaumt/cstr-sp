@@ -15,30 +15,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-        with:
-          path: "src"
-
-      - name: Checkout builds branch
-        uses: actions/checkout@v4
-        with:
-          ref: "builds"
-          path: "builds"
-        continue-on-error: true
-
-      - name: Create or Initialize builds directory
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/builds
-          cd $GITHUB_WORKSPACE/builds
-          git init
-          git branch -M builds
-          git remote add origin https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git || git remote set-url origin https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git pull origin builds || true
-
-      - name: Clear old builds
-        run: rm $GITHUB_WORKSPACE/builds/*.cs3 || true
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -53,22 +34,19 @@ jobs:
 
       - name: Build Plugins
         run: |
-          cd $GITHUB_WORKSPACE/src
           chmod +x gradlew
           ./gradlew make makePluginsJson
-          cp **/build/*.cs3 $GITHUB_WORKSPACE/builds/ || true
-          cp build/plugins.json $GITHUB_WORKSPACE/builds/ || true
-          cp repo.json $GITHUB_WORKSPACE/builds/ || true
+          cp **/build/*.cs3 . || true
+          cp build/plugins.json . || true
 
       - name: Replace USERNAME in repo.json
         run: |
-          sed -i "s/USERNAME/${{ github.repository_owner }}/g" $GITHUB_WORKSPACE/builds/repo.json
+          sed -i "s/USERNAME/${{ github.repository_owner }}/g" repo.json
 
       - name: Commit and Push
         run: |
-          cd $GITHUB_WORKSPACE/builds
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
           git add .
           git commit -m "Build $GITHUB_SHA" || exit 0
-          git push -u origin builds --force
+          git push origin main
