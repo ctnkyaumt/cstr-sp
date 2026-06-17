@@ -2,175 +2,161 @@ package com.cstrsp
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
 
 class Cstrsp : MainAPI() {
-    override var mainUrl = "https://strmd.link"
+    override var mainUrl = "https://streamed.pk"
     override var name = "cstrsp"
     override val hasMainPage = true
     override var lang = "en"
-    override val hasQuickSearch = false
+    override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Live)
 
-    override val mainPage = mainPageOf(
-        mainUrl to "Live"
+    private val apiUrl = "https://streamed.pk/api"
+
+    data class APIMatch(
+        val id: String,
+        val title: String,
+        val category: String,
+        val date: Long,
+        val poster: String? = null,
+        val popular: Boolean = false,
+        val teams: APITeams? = null,
+        val sources: List<APISource>? = null
+    )
+
+    data class APITeams(
+        val home: APITeam? = null,
+        val away: APITeam? = null
+    )
+
+    data class APITeam(
+        val name: String,
+        val badge: String
+    )
+
+    data class APISource(
+        val source: String,
+        val id: String
+    )
+
+    data class APIStream(
+        val id: String,
+        val streamNo: Int,
+        val language: String? = null,
+        val hd: Boolean = false,
+        val embedUrl: String,
+        val source: String
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Fetch strmd.link and find the online element
-        val document = app.get(mainUrl).document
+        val matches = app.get("$apiUrl/matches/live").parsedSafe<List<APIMatch>>() ?: emptyList()
         
-        // Find all a elements that have a text-green-500 class indicating online
-        val aElements = document.select("body > div:first-child > div > div > a").toList()
+        // Group by category to create rows on the homepage
+        val grouped = matches.groupBy { it.category }
         
-        var targetUrl: String? = null
-        for (a in aElements) {
-            val h2 = a.selectFirst("div > h2.text-green-500")
-            if (h2 != null) {
-                targetUrl = fixUrlNull(a.attr("href"))
-                break
+        val homePageLists = grouped.map { (category, categoryMatches) ->
+            val list = categoryMatches.mapNotNull { match ->
+                toSearchResponse(match)
             }
+            HomePageList(category.replaceFirstChar { it.uppercase() }, list)
         }
         
-        if (targetUrl == null) {
-            return newHomePageResponse(request.name, emptyList())
-        }
-        
-        // Load targetUrl and extract cards
-        val targetDoc = app.get(targetUrl).document
-        val searchResponses = mutableListOf<SearchResponse>()
-        
-        // Cards are located in similar paths
-        // According to user: body > div:nth-child(1) > div:nth-child(1) > div > div.h-full.mt-2.p-1 > div:nth-child(4) > div > div > div > a
-        val cards = targetDoc.select("div.h-full.mt-2.p-1 > div > div > div > div > a").toList()
-        
-        for (card in cards) {
-            val titleElem = card.selectFirst("h1")
-            val imgElem = card.selectFirst("img")
-            
-            val title = titleElem?.text() ?: titleElem?.attr("title") ?: continue
-            val href = fixUrlNull(card.attr("href")) ?: continue
-            val posterUrl = fixUrlNull(imgElem?.attr("src"))
-            
-            searchResponses.add(
-                newLiveSearchResponse(title, href, TvType.Live) {
-                    this.posterUrl = posterUrl
-                }
-            )
-        }
-
-        return newHomePageResponse(request.name, searchResponses)
+        return newHomePageResponse(homePageLists)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Perform the same logic as getMainPage but filter by query
-        val document = app.get(mainUrl).document
-        val aElements = document.select("body > div:first-child > div > div > a").toList()
-        
-        var targetUrl: String? = null
-        for (a in aElements) {
-            val h2 = a.selectFirst("div > h2.text-green-500")
-            if (h2 != null) {
-                targetUrl = fixUrlNull(a.attr("href"))
-                break
-            }
+        val matches = app.get("$apiUrl/matches/live").parsedSafe<List<APIMatch>>() ?: emptyList()
+        return matches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
+            toSearchResponse(match)
         }
-        
-        if (targetUrl == null) {
-            return emptyList()
-        }
-        
-        val targetDoc = app.get(targetUrl).document
-        val searchResponses = mutableListOf<SearchResponse>()
-        
-        val cards = targetDoc.select("div.h-full.mt-2.p-1 > div > div > div > div > a").toList()
-        
-        for (card in cards) {
-            val titleElem = card.selectFirst("h1")
-            val imgElem = card.selectFirst("img")
-            
-            val title = titleElem?.text() ?: titleElem?.attr("title") ?: continue
-            if (!title.contains(query, ignoreCase = true)) continue
-            
-            val href = fixUrlNull(card.attr("href")) ?: continue
-            val posterUrl = fixUrlNull(imgElem?.attr("src"))
-            
-            searchResponses.add(
-                newLiveSearchResponse(title, href, TvType.Live) {
-                    this.posterUrl = posterUrl
-                }
-            )
+    }
+
+    private fun toSearchResponse(match: APIMatch): SearchResponse? {
+        val posterUrl = if (match.poster != null) {
+            "$mainUrl${match.poster}.webp"
+        } else if (match.teams?.home?.badge != null) {
+            "$apiUrl/images/badge/${match.teams.home.badge}.webp"
+        } else {
+            null
         }
 
-        return searchResponses
+        return newLiveSearchResponse(
+            name = match.title,
+            url = "$mainUrl/match/${match.id}" // Pass match URL
+        ) {
+            this.posterUrl = posterUrl
+        }
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url).document
+        val matchId = url.substringAfterLast("/")
         
-        // Provide the same url back to loadLinks to extract streams
-        // The title can be retrieved from the page
-        val title = document.selectFirst("title")?.text() ?: "Live Stream"
+        val matches = app.get("$apiUrl/matches/live").parsedSafe<List<APIMatch>>() ?: emptyList()
+        val match = matches.find { it.id == matchId } ?: return null
+        
+        val posterUrl = if (match.poster != null) {
+            "$mainUrl${match.poster}.webp"
+        } else if (match.teams?.home?.badge != null) {
+            "$apiUrl/images/badge/${match.teams.home.badge}.webp"
+        } else {
+            null
+        }
 
-        return newLiveStreamLoadResponse(title, url, url) {
-            // Optional: posterUrl etc.
+        return newLiveStreamLoadResponse(
+            name = match.title,
+            url = url,
+            dataUrl = AppUtils.toJson(match.sources ?: emptyList<APISource>()) // Serialize sources directly
+        ) {
+            this.posterUrl = posterUrl
+            this.plot = "Live stream for ${match.title}"
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        // data is the url of the details page
-        val document = app.get(data).document
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val sources = AppUtils.parseJson<List<APISource>>(data)
         
-        // Find p-2 a tags
-        val p2Links = document.select("div.p-2 > a").toList()
-        
-        for (link in p2Links) {
-            val href = fixUrlNull(link.attr("href")) ?: continue
+        sources.forEach { source ->
+            val streams = app.get("$apiUrl/stream/${source.source}/${source.id}").parsedSafe<List<APIStream>>() ?: emptyList()
             
-            // Try loading this sub-page
-            try {
-                val subPage = app.get(href).document
+            streams.forEach { stream ->
+                val isHD = stream.hd
+                val langStr = stream.language ?: "Unknown"
+                val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
+                val name = "${source.source.replaceFirstChar { it.uppercase() }} - $langStr"
                 
-                // Find iframe or #player source
-                val iframe = subPage.selectFirst("iframe")
-                val iframeSrc = fixUrlNull(iframe?.attr("src"))
+                val embedUrl = stream.embedUrl
                 
-                if (iframeSrc != null) {
-                    // It could be an M3U8 directly, or an embed.
-                    // For now, let's just use it as M3U8 if we detect it, or rely on extractors.
-                    // Based on user note: deeper element might be #player > div.jw-wrapper > ... > video
-                    // Let's load the iframeSrc to see if it's an M3U8 or if we can extract JWPlayer source
-                    try {
-                        val iframeHtml = app.get(iframeSrc).text
-                        // Extract m3u8 using regex from script blocks
-                        val m3u8Regex = Regex("[\"'](https?://[^\"']+\\.m3u8.*?)[\"']")
-                        val matchResult = m3u8Regex.find(iframeHtml)
-                        if (matchResult != null) {
-                            val streamUrl = matchResult.groupValues[1]
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = name,
-                                    name = "$name - Stream",
-                                    url = streamUrl,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.headers = mapOf("Referer" to iframeSrc)
-                                    this.quality = Qualities.Unknown.value
-                                }
-                            )
-                        } else {
-                            // If no m3u8 regex match, maybe the iframeSrc is a well-known embed
-                            // Let Cloudstream generic extractor try
-                            loadExtractor(iframeSrc, data, subtitleCallback, callback)
+                // Fetch the embed iframe to extract m3u8
+                val embedDoc = app.get(embedUrl).document
+                val scriptStr = embedDoc.select("script").outerHtml()
+                val m3u8Regex = Regex("(?i)(https?://[^\"']+\\.m3u8[^\"']*)")
+                val m3u8Match = m3u8Regex.find(scriptStr)
+                
+                if (m3u8Match != null) {
+                    val streamUrl = m3u8Match.groupValues[1]
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name - Stream",
+                            url = streamUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.headers = mapOf("Referer" to embedUrl)
+                            this.quality = quality
                         }
-                    } catch (e: Exception) {
-                        // Ignore extraction errors and continue to next
-                    }
+                    )
+                } else {
+                    // Try generic extractor if not a direct m3u8
+                    loadExtractor(embedUrl, embedUrl, subtitleCallback, callback)
                 }
-            } catch (e: Exception) {
-                // Try next
             }
         }
+        
         return true
     }
 }
