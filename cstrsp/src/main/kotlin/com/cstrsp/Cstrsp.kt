@@ -107,7 +107,7 @@ class Cstrsp : MainAPI() {
         return newLiveStreamLoadResponse(
             name = match.title,
             url = url,
-            dataUrl = AppUtils.toJson(match.sources ?: emptyList<APISource>()) // Serialize sources directly
+            dataUrl = (match.sources ?: emptyList<APISource>()).toJson() // Serialize sources directly
         ) {
             this.posterUrl = posterUrl
             this.plot = "Live stream for ${match.title}"
