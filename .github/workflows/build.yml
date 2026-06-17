@@ -28,14 +28,14 @@ jobs:
           path: "builds"
         continue-on-error: true
 
-      - name: Create builds directory if it does not exist
+      - name: Create or Initialize builds directory
         run: |
-          if [ ! -d "$GITHUB_WORKSPACE/builds" ]; then
-            mkdir $GITHUB_WORKSPACE/builds
-            cd $GITHUB_WORKSPACE/builds
-            git init
-            git checkout -b builds
-          fi
+          mkdir -p $GITHUB_WORKSPACE/builds
+          cd $GITHUB_WORKSPACE/builds
+          git init
+          git branch -M builds
+          git remote add origin https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git || git remote set-url origin https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git pull origin builds || true
 
       - name: Clear old builds
         run: rm $GITHUB_WORKSPACE/builds/*.cs3 || true
