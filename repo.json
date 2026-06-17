@@ -3,6 +3,6 @@
     "description": "Custom Cloudstream Extensions",
     "manifestVersion": 1,
     "pluginLists": [
-        "https://raw.githubusercontent.com/USERNAME/cstr-sp/main/plugins.json"
+        "https://raw.githubusercontent.com/ctnkyaumt/cstr-sp/main/plugins.json"
     ]
 }
