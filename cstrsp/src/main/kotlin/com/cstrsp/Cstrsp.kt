@@ -4,7 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
-
+import com.fasterxml.jackson.annotation.JsonProperty
 class Cstrsp : MainAPI() {
     override var mainUrl = "https://streamed.pk"
     override var name = "cstrsp"
@@ -16,42 +16,42 @@ class Cstrsp : MainAPI() {
     private val apiUrl = "https://streamed.pk/api"
 
     data class APIMatch(
-        val id: String,
-        val title: String,
-        val category: String,
-        val date: Long,
-        val poster: String? = null,
-        val popular: Boolean = false,
-        val teams: APITeams? = null,
-        val sources: List<APISource>? = null
+        @JsonProperty("id") val id: String,
+        @JsonProperty("title") val title: String,
+        @JsonProperty("category") val category: String,
+        @JsonProperty("date") val date: Long,
+        @JsonProperty("poster") val poster: String? = null,
+        @JsonProperty("popular") val popular: Boolean = false,
+        @JsonProperty("teams") val teams: APITeams? = null,
+        @JsonProperty("sources") val sources: List<APISource>? = null
     )
 
     data class APITeams(
-        val home: APITeam? = null,
-        val away: APITeam? = null
+        @JsonProperty("home") val home: APITeam? = null,
+        @JsonProperty("away") val away: APITeam? = null
     )
 
     data class APITeam(
-        val name: String,
-        val badge: String
+        @JsonProperty("name") val name: String,
+        @JsonProperty("badge") val badge: String
     )
 
     data class APISource(
-        val source: String,
-        val id: String
+        @JsonProperty("source") val source: String,
+        @JsonProperty("id") val id: String
     )
 
     data class APIStream(
-        val id: String,
-        val streamNo: Int,
-        val language: String? = null,
-        val hd: Boolean = false,
-        val embedUrl: String,
-        val source: String
+        @JsonProperty("id") val id: String,
+        @JsonProperty("streamNo") val streamNo: Int,
+        @JsonProperty("language") val language: String? = null,
+        @JsonProperty("hd") val hd: Boolean = false,
+        @JsonProperty("embedUrl") val embedUrl: String,
+        @JsonProperty("source") val source: String
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val matches = app.get("$apiUrl/matches/live").parsedSafe<List<APIMatch>>() ?: emptyList()
+        val matches = app.get("$apiUrl/matches/live").parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
         
         // Group by category to create rows on the homepage
         val grouped = matches.groupBy { it.category }
@@ -67,7 +67,7 @@ class Cstrsp : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val matches = app.get("$apiUrl/matches/live").parsedSafe<List<APIMatch>>() ?: emptyList()
+        val matches = app.get("$apiUrl/matches/live").parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
         return matches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
             toSearchResponse(match)
         }
@@ -93,7 +93,7 @@ class Cstrsp : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val matchId = url.substringAfterLast("/")
         
-        val matches = app.get("$apiUrl/matches/live").parsedSafe<List<APIMatch>>() ?: emptyList()
+        val matches = app.get("$apiUrl/matches/live").parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
         val match = matches.find { it.id == matchId } ?: return null
         
         val posterUrl = if (match.poster != null) {
@@ -123,7 +123,7 @@ class Cstrsp : MainAPI() {
         val sources = AppUtils.parseJson<List<APISource>>(data)
         
         sources.forEach { source ->
-            val streams = app.get("$apiUrl/stream/${source.source}/${source.id}").parsedSafe<List<APIStream>>() ?: emptyList()
+            val streams = app.get("$apiUrl/stream/${source.source}/${source.id}").parsedSafe<Array<APIStream>>()?.toList() ?: emptyList()
             
             streams.forEach { stream ->
                 val isHD = stream.hd
