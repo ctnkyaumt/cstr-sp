@@ -21,7 +21,7 @@ class Cstrsp : MainAPI() {
         val document = app.get(mainUrl).document
         
         // Find all a elements that have a text-green-500 class indicating online
-        val aElements = document.select("body > div:first-child > div > div > a")
+        val aElements = document.select("body > div:first-child > div > div > a").toList()
         
         var targetUrl: String? = null
         for (a in aElements) {
@@ -42,7 +42,7 @@ class Cstrsp : MainAPI() {
         
         // Cards are located in similar paths
         // According to user: body > div:nth-child(1) > div:nth-child(1) > div > div.h-full.mt-2.p-1 > div:nth-child(4) > div > div > div > a
-        val cards = targetDoc.select("div.h-full.mt-2.p-1 > div > div > div > div > a")
+        val cards = targetDoc.select("div.h-full.mt-2.p-1 > div > div > div > div > a").toList()
         
         for (card in cards) {
             val titleElem = card.selectFirst("h1")
@@ -65,7 +65,7 @@ class Cstrsp : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         // Perform the same logic as getMainPage but filter by query
         val document = app.get(mainUrl).document
-        val aElements = document.select("body > div:first-child > div > div > a")
+        val aElements = document.select("body > div:first-child > div > div > a").toList()
         
         var targetUrl: String? = null
         for (a in aElements) {
@@ -83,7 +83,7 @@ class Cstrsp : MainAPI() {
         val targetDoc = app.get(targetUrl).document
         val searchResponses = mutableListOf<SearchResponse>()
         
-        val cards = targetDoc.select("div.h-full.mt-2.p-1 > div > div > div > div > a")
+        val cards = targetDoc.select("div.h-full.mt-2.p-1 > div > div > div > div > a").toList()
         
         for (card in cards) {
             val titleElem = card.selectFirst("h1")
@@ -112,7 +112,7 @@ class Cstrsp : MainAPI() {
         // The title can be retrieved from the page
         val title = document.selectFirst("title")?.text() ?: "Live Stream"
 
-        return newLiveStreamLoadResponse(title, url, TvType.Live, url) {
+        return newLiveStreamLoadResponse(title, url, url) {
             // Optional: posterUrl etc.
         }
     }
@@ -122,7 +122,7 @@ class Cstrsp : MainAPI() {
         val document = app.get(data).document
         
         // Find p-2 a tags
-        val p2Links = document.select("div.p-2 > a")
+        val p2Links = document.select("div.p-2 > a").toList()
         
         for (link in p2Links) {
             val href = fixUrlNull(link.attr("href")) ?: continue
@@ -148,13 +148,13 @@ class Cstrsp : MainAPI() {
                         if (matchResult != null) {
                             val streamUrl = matchResult.groupValues[1]
                             callback.invoke(
-                                ExtractorLink(
+                                newExtractorLink(
                                     source = name,
                                     name = "$name - Stream",
                                     url = streamUrl,
                                     referer = iframeSrc,
                                     quality = Qualities.Unknown.value,
-                                    isM3u8 = true
+                                    type = ExtractorLinkType.M3U8
                                 )
                             )
                         } else {
