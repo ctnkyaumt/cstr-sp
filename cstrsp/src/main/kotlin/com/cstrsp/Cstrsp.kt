@@ -2,6 +2,8 @@ package com.cstrsp
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 
 class Cstrsp : MainAPI() {
     override var mainUrl = "https://streamed.pk"
