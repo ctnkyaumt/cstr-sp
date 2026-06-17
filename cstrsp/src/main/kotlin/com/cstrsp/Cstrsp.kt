@@ -154,7 +154,25 @@ class Cstrsp : MainAPI() {
                     )
                 } else {
                     // Try generic extractor if not a direct m3u8
-                    loadExtractor(embedUrl, embedUrl, subtitleCallback, callback)
+                    loadExtractor(embedUrl, embedUrl, subtitleCallback) { link ->
+                        // Inject Referer and Origin headers to prevent ExoPlayer 403 errors
+                        val newHeaders = (link.headers ?: mapOf()).toMutableMap()
+                        newHeaders["Origin"] = "https://embed.st"
+                        newHeaders["Referer"] = embedUrl
+                        
+                        callback.invoke(
+                            ExtractorLink(
+                                source = link.source,
+                                name = link.name,
+                                url = link.url,
+                                referer = embedUrl,
+                                quality = link.quality,
+                                type = link.type,
+                                headers = newHeaders,
+                                extractorData = link.extractorData
+                            )
+                        )
+                    }
                 }
             }
         }
