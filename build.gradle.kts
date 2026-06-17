@@ -11,9 +11,9 @@ buildscript {
     }
 
     dependencies {
-        classpath("com.android.tools.build:gradle:8.1.0")
+        classpath("com.android.tools.build:gradle:9.1.0")
         classpath("com.github.recloudstream.gradle:gradle:81b1d424d")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.20")
     }
 }
 
@@ -57,7 +57,7 @@ subprojects {
 
     android {
         namespace = "com.cstrsp"
-        compileSdk = 34
+        compileSdk = 36
 
         defaultConfig {
             minSdk = 21
