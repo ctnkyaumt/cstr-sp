@@ -152,10 +152,11 @@ class Cstrsp : MainAPI() {
                                     source = name,
                                     name = "$name - Stream",
                                     url = streamUrl,
-                                    referer = iframeSrc,
-                                    quality = Qualities.Unknown.value,
                                     type = ExtractorLinkType.M3U8
-                                )
+                                ) {
+                                    this.headers = mapOf("Referer" to iframeSrc)
+                                    this.quality = Qualities.Unknown.value
+                                }
                             )
                         } else {
                             // If no m3u8 regex match, maybe the iframeSrc is a well-known embed
