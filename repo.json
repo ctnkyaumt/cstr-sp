@@ -1,0 +1,8 @@
+{
+    "name": "cstr-sp",
+    "description": "Custom Cloudstream Extensions",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/ctnkyaumt/cstr-sp/builds/plugins.json"
+    ]
+}
