@@ -70,9 +70,18 @@ class Cstrsp : MainAPI() {
     )
 
     data class CDNChannel(
-        @JsonProperty("channel_name") val channel_name: String?,
-        @JsonProperty("channel_code") val channel_code: String?,
-        @JsonProperty("url") val url: String?
+        @JsonProperty("channel_name") val channel_name: String? = null,
+        @JsonProperty("channel_code") val channel_code: String? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("code") val code: String? = null,
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("image") val image: String? = null,
+        @JsonProperty("status") val status: String? = null
+    )
+
+    data class CDNChannelsResponse(
+        @JsonProperty("total_channels") val total_channels: Int? = null,
+        @JsonProperty("channels") val channels: List<CDNChannel>? = null
     )
 
     // Helper to fetch matches from streamed.pk
@@ -122,8 +131,8 @@ class Cstrsp : MainAPI() {
                             val matchStr = item?.toJson() ?: ""
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
-                            // Include only live matches to match the website UI
-                            if (cdnMatch != null && cdnMatch.status?.lowercase() == "live") {
+                            // Include live and upcoming
+                            if (cdnMatch != null && (cdnMatch.status?.lowercase() == "live" || cdnMatch.status?.lowercase() == "ns" || cdnMatch.status?.lowercase() == "pst")) {
                                 val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
                                     cdnMatch.event ?: "Unknown Match"
                                 } else {
@@ -157,6 +166,29 @@ class Cstrsp : MainAPI() {
             // Backup source failed
         }
 
+        // 3. Fetch CDN Live TV Channels
+        try {
+            val channelsJson = app.get("$cdnApiUrl/channels/?user=cdnlivetv&plan=free").text
+            val channelsRes = AppUtils.parseJson<CDNChannelsResponse>(channelsJson)
+            val channelsList = mutableListOf<SearchResponse>()
+            
+            channelsRes?.channels?.filter { it.status == "online" }?.forEach { ch ->
+                val chName = ch.name ?: "Unknown Channel"
+                val chStr = ch.toJson()
+                channelsList.add(
+                    newLiveSearchResponse(
+                        name = "$chName [Channel]",
+                        url = "cdnlivetvchannel://||$chStr"
+                    ) {
+                        this.posterUrl = ch.image
+                    }
+                )
+            }
+            if (channelsList.isNotEmpty()) {
+                homePageLists.add(HomePageList("24/7 Channels [StreamSports]", channelsList))
+            }
+        } catch (e: Exception) {}
+
         return newHomePageResponse(homePageLists)
     }
 
@@ -189,7 +221,7 @@ class Cstrsp : MainAPI() {
                                 val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
                                 val status = cdnMatch.status?.lowercase()
                                 
-                                if (status == "live" && title.contains(query, ignoreCase = true)) {
+                                if ((status == "live" || status == "ns" || status == "pst") && title.contains(query, ignoreCase = true)) {
                                     val isLive = status == "live"
                                     val liveLabel = if (!isLive) " [Upcoming]" else ""
                                     val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
@@ -210,10 +242,44 @@ class Cstrsp : MainAPI() {
             }
         } catch (e: Exception) {}
 
+        // Search CDN Live TV Channels
+        try {
+            val channelsJson = app.get("$cdnApiUrl/channels/?user=cdnlivetv&plan=free").text
+            val channelsRes = AppUtils.parseJson<CDNChannelsResponse>(channelsJson)
+            channelsRes?.channels?.filter { it.status == "online" && it.name?.contains(query, ignoreCase = true) == true }?.forEach { ch ->
+                val chName = ch.name ?: "Unknown Channel"
+                val chStr = ch.toJson()
+                results.add(
+                    newLiveSearchResponse(
+                        name = "$chName [Channel]",
+                        url = "cdnlivetvchannel://||$chStr"
+                    ) {
+                        this.posterUrl = ch.image
+                    }
+                )
+            }
+        } catch (e: Exception) {}
+
         return results
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        // Handle CDN Live TV Channels
+        if (url.startsWith("cdnlivetvchannel://")) {
+            val data = url.substringAfter("||")
+            val ch = AppUtils.parseJson<CDNChannel>(data)
+            if (ch != null) {
+                return newLiveStreamLoadResponse(
+                    name = "${ch.name} [Channel]",
+                    url = url,
+                    dataUrl = listOf(ch).toJson()
+                ) {
+                    this.posterUrl = ch.image
+                    this.plot = "24/7 Live Stream: ${ch.name}"
+                }
+            }
+        }
+
         // Handle CDN Live TV (Backup Source) URL format
         if (url.startsWith("cdnlivetv://")) {
             val data = url.substringAfter("||")
