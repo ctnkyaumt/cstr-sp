@@ -84,6 +84,10 @@ class Cstrsp : MainAPI() {
         @JsonProperty("channels") val channels: List<CDNChannel>? = null
     )
 
+    data class CDNEventsResponse(
+        @JsonProperty("cdn-live-tv") val cdnLiveTv: Map<String, List<CDNMatch>>? = null
+    )
+
     // Helper to fetch matches from streamed.pk
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> {
         return try {
@@ -119,47 +123,37 @@ class Cstrsp : MainAPI() {
         // 2. Fetch CDN Live TV (Backup Source)
         try {
             val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
-            val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
-            
-            parsedMap?.forEach { (key, value) ->
-                val categoriesMap = if (key == "cdn-live-tv" && value is Map<*, *>) value else mapOf(key to value)
-                categoriesMap.forEach categoryLoop@{ categoryKey, items ->
-                    if (items !is List<*>) return@categoryLoop
-                    val matchList = mutableListOf<SearchResponse>()
-                    items.forEach { item ->
-                        try {
-                            val matchStr = item?.toJson() ?: ""
-                            val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
-                            
-                            // Include live and upcoming
-                            if (cdnMatch != null && (cdnMatch.status?.lowercase() == "live" || cdnMatch.status?.lowercase() == "ns" || cdnMatch.status?.lowercase() == "pst")) {
-                                val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
-                                    cdnMatch.event ?: "Unknown Match"
-                                } else {
-                                    "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
-                                }
-                                
-                                val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
-                                val isLive = cdnMatch.status?.lowercase() == "live"
-                                val liveLabel = if (!isLive) " [Upcoming]" else ""
-                                
-                                matchList.add(
-                                    newLiveSearchResponse(
-                                        name = "$title [StreamSports]$liveLabel",
-                                        // Pass the match JSON embedded in the URL so load() can parse it instantly
-                                        url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
-                                    ) {
-                                        this.posterUrl = posterUrl
-                                    }
-                                )
+            val eventsRes = AppUtils.parseJson<CDNEventsResponse>(cdnJson)
+            eventsRes?.cdnLiveTv?.forEach { (category, items) ->
+                val matchList = mutableListOf<SearchResponse>()
+                items.forEach { cdnMatch ->
+                    try {
+                        // Only include matches that actually have channels available
+                        if (!cdnMatch.channels.isNullOrEmpty() && (cdnMatch.status?.lowercase() == "live" || cdnMatch.status?.lowercase() == "ns" || cdnMatch.status?.lowercase() == "pst")) {
+                            val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
+                                cdnMatch.event ?: "Unknown Match"
+                            } else {
+                                "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
                             }
-                        } catch (e: Exception) {
-                            // Ignore parsing errors for individual items
+                            
+                            val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+                            val isLive = cdnMatch.status?.lowercase() == "live"
+                            val liveLabel = if (!isLive) " [Upcoming]" else ""
+                            val matchStr = cdnMatch.toJson()
+                            
+                            matchList.add(
+                                newLiveSearchResponse(
+                                    name = "$title [StreamSports]$liveLabel",
+                                    url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
+                                ) {
+                                    this.posterUrl = posterUrl
+                                }
+                            )
                         }
-                    }
-                    if (matchList.isNotEmpty()) {
-                        homePageLists.add(HomePageList("$categoryKey [StreamSports]", matchList))
-                    }
+                    } catch (e: Exception) {}
+                }
+                if (matchList.isNotEmpty()) {
+                    homePageLists.add(HomePageList("$category [StreamSports]", matchList))
                 }
             }
         } catch (e: Exception) {
@@ -207,37 +201,30 @@ class Cstrsp : MainAPI() {
         // Search CDN Live TV (Backup)
         try {
             val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
-            val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
-            parsedMap?.forEach { (key, value) ->
-                val categoriesMap = if (key == "cdn-live-tv" && value is Map<*, *>) value else mapOf(key to value)
-                categoriesMap.forEach categoryLoop@{ _, items ->
-                    if (items !is List<*>) return@categoryLoop
-                    items.forEach { item ->
-                        try {
-                            val matchStr = item?.toJson() ?: ""
-                            val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
+            val eventsRes = AppUtils.parseJson<CDNEventsResponse>(cdnJson)
+            eventsRes?.cdnLiveTv?.forEach { (_, items) ->
+                items.forEach { cdnMatch ->
+                    try {
+                        val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
+                        val status = cdnMatch.status?.lowercase()
+                        
+                        // Only include matches that actually have channels available
+                        if (!cdnMatch.channels.isNullOrEmpty() && (status == "live" || status == "ns" || status == "pst") && title.contains(query, ignoreCase = true)) {
+                            val isLive = status == "live"
+                            val liveLabel = if (!isLive) " [Upcoming]" else ""
+                            val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+                            val matchStr = cdnMatch.toJson()
                             
-                            if (cdnMatch != null) {
-                                val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
-                                val status = cdnMatch.status?.lowercase()
-                                
-                                if ((status == "live" || status == "ns" || status == "pst") && title.contains(query, ignoreCase = true)) {
-                                    val isLive = status == "live"
-                                    val liveLabel = if (!isLive) " [Upcoming]" else ""
-                                    val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
-                                    
-                                    results.add(
-                                        newLiveSearchResponse(
-                                            name = "$title [StreamSports]$liveLabel",
-                                            url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
-                                        ) {
-                                            this.posterUrl = posterUrl
-                                        }
-                                    )
+                            results.add(
+                                newLiveSearchResponse(
+                                    name = "$title [StreamSports]$liveLabel",
+                                    url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
+                                ) {
+                                    this.posterUrl = posterUrl
                                 }
-                            }
-                        } catch (e: Exception) {}
-                    }
+                            )
+                        }
+                    } catch (e: Exception) {}
                 }
             }
         } catch (e: Exception) {}
