@@ -198,23 +198,57 @@ class Cstrsp : MainAPI() {
                         val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
                         val sourceName = source.source.replaceFirstChar { it.uppercase() }
                         val name = "$sourceName - $langStr"
+                        val embedUrl = stream.embedUrl
 
-                        // Pass the embedUrl directly as the stream URL
-                        // The embed URL from the API is the playable endpoint
-                        callback(
-                            newExtractorLink(
-                                source = name,
-                                name = "$name - Stream ${stream.streamNo}",
-                                url = stream.embedUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.headers = mapOf(
-                                    "Referer" to "$mainUrl/",
-                                    "Origin" to mainUrl
+                        // The embedUrl is an HTML player page (embed.st), not a direct stream.
+                        // Try CloudStream's built-in extractors first.
+                        var extractorFound = false
+                        try {
+                            extractorFound = loadExtractor(
+                                embedUrl,
+                                "$mainUrl/",
+                                subtitleCallback
+                            ) { link ->
+                                // Re-wrap with proper headers to prevent 403 errors
+                                val newHeaders = (link.headers).toMutableMap()
+                                newHeaders["Referer"] = "$mainUrl/"
+                                newHeaders["Origin"] = mainUrl
+
+                                callback.invoke(
+                                    ExtractorLink(
+                                        source = "$name - Stream ${stream.streamNo}",
+                                        name = "$name - Stream ${stream.streamNo}",
+                                        url = link.url,
+                                        referer = "$mainUrl/",
+                                        quality = quality,
+                                        type = link.type,
+                                        headers = newHeaders,
+                                        extractorData = link.extractorData
+                                    )
                                 )
-                                this.quality = quality
                             }
-                        )
+                        } catch (e: Exception) {
+                            extractorFound = false
+                        }
+
+                        // Fallback: provide the embed URL as a VIDEO type link
+                        // CloudStream's WebView player can handle HTML embed pages
+                        if (!extractorFound) {
+                            callback(
+                                newExtractorLink(
+                                    source = name,
+                                    name = "$name - Stream ${stream.streamNo}",
+                                    url = embedUrl,
+                                    type = ExtractorLinkType.VIDEO
+                                ) {
+                                    this.headers = mapOf(
+                                        "Referer" to "$mainUrl/",
+                                        "Origin" to mainUrl
+                                    )
+                                    this.quality = quality
+                                }
+                            )
+                        }
                     } catch (e: Exception) {
                         // Skip this individual stream but continue with others
                     }
