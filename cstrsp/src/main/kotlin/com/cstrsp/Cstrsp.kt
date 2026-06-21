@@ -2,6 +2,7 @@ package com.cstrsp
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -116,7 +117,7 @@ class Cstrsp : MainAPI() {
                     val matchList = mutableListOf<SearchResponse>()
                     items.forEach { item ->
                         try {
-                            val matchStr = AppUtils.toJson(item)
+                            val matchStr = item.toJson()
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
                             // Include live and upcoming (NS = Not Started)
@@ -177,7 +178,7 @@ class Cstrsp : MainAPI() {
                 if (items is List<*>) {
                     items.forEach { item ->
                         try {
-                            val matchStr = AppUtils.toJson(item)
+                            val matchStr = item.toJson()
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
                             if (cdnMatch != null) {
@@ -227,7 +228,7 @@ class Cstrsp : MainAPI() {
                     name = "$title [StreamSports]$liveLabel",
                     url = url,
                     // Pass channels array as JSON to loadLinks
-                    dataUrl = AppUtils.toJson(cdnMatch.channels ?: emptyList<CDNChannel>())
+                    dataUrl = (cdnMatch.channels ?: emptyList<CDNChannel>()).toJson()
                 ) {
                     this.posterUrl = posterUrl
                     this.plot = if (isLive) "Live stream for $title" else "Upcoming: $title"
@@ -267,7 +268,7 @@ class Cstrsp : MainAPI() {
         return newLiveStreamLoadResponse(
             name = displayTitle,
             url = url,
-            dataUrl = AppUtils.toJson(match.sources ?: emptyList<APISource>())
+            dataUrl = (match.sources ?: emptyList<APISource>()).toJson()
         ) {
             this.posterUrl = posterUrl
             this.plot = if (isLive) "Live stream for ${match.title}" else "Upcoming: ${match.title}"
