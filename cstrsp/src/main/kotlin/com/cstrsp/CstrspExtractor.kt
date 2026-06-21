@@ -38,17 +38,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     allowContentAccess                 = true
                     mediaPlaybackRequiresUserGesture   = false
                     mixedContentMode                   = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    userAgentString                    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
                 }
-
-                evaluateJavascript(
-                    """
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-                    Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
-                    window.chrome = { runtime: {} };
-                    """.trimIndent()
-                ) {}
 
                 webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
