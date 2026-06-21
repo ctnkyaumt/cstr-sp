@@ -52,6 +52,11 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
                 webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val method = request?.method ?: "GET"
+                        if (method.uppercase() != "GET") {
+                            return super.shouldInterceptRequest(view, request)
+                        }
+
                         @Suppress("NAME_SHADOWING") val url = request?.url.toString()
                         val headers = request?.requestHeaders
 
@@ -92,8 +97,8 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
             return
         }
         
-        // Skip obvious static assets
-        if (url.endsWith(".js") || url.endsWith(".css") || url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".webp") || url.endsWith(".svg") || url.endsWith(".gif") || url.endsWith(".woff") || url.endsWith(".woff2") || url.endsWith(".ts")) {
+        // Skip obvious static assets and API endpoints that use GET
+        if (url.endsWith(".js") || url.endsWith(".css") || url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".webp") || url.endsWith(".svg") || url.endsWith(".gif") || url.endsWith(".woff") || url.endsWith(".woff2") || url.endsWith(".ts") || url.endsWith("/fetch")) {
             return
         }
 
