@@ -75,7 +75,11 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     }
                 }
 
-                loadUrl(url)
+                if (referer != null) {
+                    loadUrl(url, mapOf("Referer" to referer))
+                } else {
+                    loadUrl(url)
+                }
             }
         }
 
