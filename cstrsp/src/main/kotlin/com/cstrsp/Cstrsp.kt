@@ -340,19 +340,15 @@ class Cstrsp : MainAPI() {
     
                             // Pass the embed URL to our WebView extractor (or built-in extractors)
                             loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
-                                val newHeaders = link.headers.toMutableMap()
-                                newHeaders["Referer"] = "$mainUrl/"
-                                newHeaders["Origin"] = mainUrl
-    
                                 callback.invoke(
                                     ExtractorLink(
                                         source = "$name - Stream ${stream.streamNo}",
                                         name = "$name - Stream ${stream.streamNo}",
                                         url = link.url,
-                                        referer = "$mainUrl/",
+                                        referer = link.referer,
                                         quality = quality,
                                         type = link.type,
-                                        headers = newHeaders,
+                                        headers = link.headers,
                                         extractorData = link.extractorData
                                     )
                                 )
