@@ -12,5 +12,6 @@ class CstrspPlugin: Plugin() {
         registerExtractorAPI(CstrspExtractor("https://embedme.top/", context))
         registerExtractorAPI(CstrspExtractor("https://strwish.com/", context))
         registerExtractorAPI(CstrspExtractor("https://cdnlivetv.tv/", context))
+        registerExtractorAPI(CstrspExtractor("https://embedindia.st/", context))
     }
 }
