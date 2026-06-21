@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.fasterxml.jackson.annotation.JsonProperty
+
 class Cstrsp : MainAPI() {
     override var mainUrl = "https://streamed.pk"
     override var name = "cstrsp"
@@ -50,40 +51,81 @@ class Cstrsp : MainAPI() {
         @JsonProperty("source") val source: String
     )
 
+    // Helper to fetch matches from an endpoint, returning empty list on failure
+    private suspend fun fetchMatches(endpoint: String): List<APIMatch> {
+        return try {
+            app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val matches = app.get("$apiUrl/matches/live").parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
-        
+        // Try live matches first
+        var matches = fetchMatches("$apiUrl/matches/live")
+        var isLive = true
+
+        // Fallback to today's matches if live is empty
+        if (matches.isEmpty()) {
+            matches = fetchMatches("$apiUrl/matches/all-today")
+            isLive = false
+        }
+
         // Group by category to create rows on the homepage
         val grouped = matches.groupBy { it.category }
-        
+
         val homePageLists = grouped.map { (category, categoryMatches) ->
             val list = categoryMatches.mapNotNull { match ->
-                toSearchResponse(match)
+                toSearchResponse(match, isLive)
             }
-            HomePageList(category.replaceFirstChar { it.uppercase() }, list)
+            val label = if (isLive) {
+                category.replaceFirstChar { it.uppercase() }
+            } else {
+                "${category.replaceFirstChar { it.uppercase() }} [Upcoming]"
+            }
+            HomePageList(label, list)
         }
-        
+
         return newHomePageResponse(homePageLists)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val matches = app.get("$apiUrl/matches/live").parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
-        return matches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
-            toSearchResponse(match)
+        // Search live matches first
+        val liveMatches = fetchMatches("$apiUrl/matches/live")
+        val results = liveMatches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
+            toSearchResponse(match, isLive = true)
+        }.toMutableList()
+
+        // Also search today's matches for broader results
+        if (results.isEmpty()) {
+            val todayMatches = fetchMatches("$apiUrl/matches/all-today")
+            results.addAll(todayMatches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
+                toSearchResponse(match, isLive = false)
+            })
         }
+
+        return results
     }
 
-    private fun toSearchResponse(match: APIMatch): SearchResponse? {
+    private fun toSearchResponse(match: APIMatch, isLive: Boolean): SearchResponse? {
         val posterUrl = if (match.poster != null) {
-            "$mainUrl${match.poster}.webp"
+            "$mainUrl${match.poster}"
         } else if (match.teams?.home?.badge != null) {
             "$apiUrl/images/badge/${match.teams.home.badge}.webp"
         } else {
             null
         }
 
+        // Build title with source names
+        val sourceNames = match.sources?.joinToString(", ") { src ->
+            src.source.replaceFirstChar { it.uppercase() }
+        } ?: ""
+        val sourceLabel = if (sourceNames.isNotEmpty()) " [$sourceNames]" else ""
+        val liveLabel = if (!isLive) " [Upcoming]" else ""
+        val displayTitle = "${match.title}$sourceLabel$liveLabel"
+
         return newLiveSearchResponse(
-            name = match.title,
+            name = displayTitle,
             url = "$mainUrl/match/${match.id}" // Pass match URL
         ) {
             this.posterUrl = posterUrl
@@ -92,25 +134,43 @@ class Cstrsp : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val matchId = url.substringAfterLast("/")
-        
-        val matches = app.get("$apiUrl/matches/live").parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
-        val match = matches.find { it.id == matchId } ?: return null
-        
+
+        // Try live first, then all-today
+        var matches = fetchMatches("$apiUrl/matches/live")
+        var match = matches.find { it.id == matchId }
+        var isLive = true
+
+        if (match == null) {
+            matches = fetchMatches("$apiUrl/matches/all-today")
+            match = matches.find { it.id == matchId }
+            isLive = false
+        }
+
+        if (match == null) return null
+
         val posterUrl = if (match.poster != null) {
-            "$mainUrl${match.poster}.webp"
+            "$mainUrl${match.poster}"
         } else if (match.teams?.home?.badge != null) {
             "$apiUrl/images/badge/${match.teams.home.badge}.webp"
         } else {
             null
         }
 
+        // Build title with source names
+        val sourceNames = match.sources?.joinToString(", ") { src ->
+            src.source.replaceFirstChar { it.uppercase() }
+        } ?: ""
+        val sourceLabel = if (sourceNames.isNotEmpty()) " [$sourceNames]" else ""
+        val liveLabel = if (!isLive) " [Upcoming]" else ""
+        val displayTitle = "${match.title}$sourceLabel$liveLabel"
+
         return newLiveStreamLoadResponse(
-            name = match.title,
+            name = displayTitle,
             url = url,
-            dataUrl = (match.sources ?: emptyList<APISource>()).toJson() // Serialize sources directly
+            dataUrl = (match.sources ?: emptyList<APISource>()).toJson()
         ) {
             this.posterUrl = posterUrl
-            this.plot = "Live stream for ${match.title}"
+            this.plot = if (isLive) "Live stream for ${match.title}" else "Upcoming: ${match.title}"
         }
     }
 
@@ -120,63 +180,50 @@ class Cstrsp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val sources = AppUtils.parseJson<List<APISource>>(data)
-        
+        val sources = try {
+            AppUtils.parseJson<List<APISource>>(data)
+        } catch (e: Exception) {
+            return false
+        }
+
         sources.forEach { source ->
-            val streams = app.get("$apiUrl/stream/${source.source}/${source.id}").parsedSafe<Array<APIStream>>()?.toList() ?: emptyList()
-            
-            streams.forEach { stream ->
-                val isHD = stream.hd
-                val langStr = stream.language ?: "Unknown"
-                val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
-                val name = "${source.source.replaceFirstChar { it.uppercase() }} - $langStr"
-                
-                val embedUrl = stream.embedUrl
-                
-                // Fetch the embed iframe to extract m3u8
-                val embedDoc = app.get(embedUrl).document
-                val scriptStr = embedDoc.select("script").outerHtml()
-                val m3u8Regex = Regex("(?i)(https?://[^\"']+\\.m3u8[^\"']*)")
-                val m3u8Match = m3u8Regex.find(scriptStr)
-                
-                if (m3u8Match != null) {
-                    val streamUrl = m3u8Match.groupValues[1]
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name - Stream",
-                            url = streamUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.headers = mapOf("Referer" to embedUrl)
-                            this.quality = quality
-                        }
-                    )
-                } else {
-                    // Try generic extractor if not a direct m3u8
-                    loadExtractor(embedUrl, embedUrl, subtitleCallback) { link ->
-                        // Inject Referer and Origin headers to prevent ExoPlayer 403 errors
-                        val newHeaders = (link.headers ?: mapOf()).toMutableMap()
-                        newHeaders["Origin"] = "https://embed.st"
-                        newHeaders["Referer"] = embedUrl
-                        
-                        callback.invoke(
-                            ExtractorLink(
-                                source = link.source,
-                                name = link.name,
-                                url = link.url,
-                                referer = embedUrl,
-                                quality = link.quality,
-                                type = link.type,
-                                headers = newHeaders,
-                                extractorData = link.extractorData
-                            )
+            try {
+                val streams = app.get("$apiUrl/stream/${source.source}/${source.id}")
+                    .parsedSafe<Array<APIStream>>()?.toList() ?: emptyList()
+
+                streams.forEach { stream ->
+                    try {
+                        val isHD = stream.hd
+                        val langStr = stream.language ?: "Unknown"
+                        val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
+                        val sourceName = source.source.replaceFirstChar { it.uppercase() }
+                        val name = "$sourceName - $langStr"
+
+                        // Pass the embedUrl directly as the stream URL
+                        // The embed URL from the API is the playable endpoint
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name - Stream ${stream.streamNo}",
+                                url = stream.embedUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.headers = mapOf(
+                                    "Referer" to "$mainUrl/",
+                                    "Origin" to mainUrl
+                                )
+                                this.quality = quality
+                            }
                         )
+                    } catch (e: Exception) {
+                        // Skip this individual stream but continue with others
                     }
                 }
+            } catch (e: Exception) {
+                // Skip this source but continue with others
             }
         }
-        
+
         return true
     }
 }
