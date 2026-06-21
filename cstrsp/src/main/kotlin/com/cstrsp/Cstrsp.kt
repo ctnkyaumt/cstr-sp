@@ -122,8 +122,8 @@ class Cstrsp : MainAPI() {
                             val matchStr = item?.toJson() ?: ""
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
-                            // Include live and upcoming (NS = Not Started)
-                            if (cdnMatch != null && (cdnMatch.status?.lowercase() == "live" || cdnMatch.status?.lowercase() == "ns" || cdnMatch.status?.lowercase() == "pst")) {
+                            // Include only live matches to match the website UI
+                            if (cdnMatch != null && cdnMatch.status?.lowercase() == "live") {
                                 val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
                                     cdnMatch.event ?: "Unknown Match"
                                 } else {
@@ -189,7 +189,7 @@ class Cstrsp : MainAPI() {
                                 val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
                                 val status = cdnMatch.status?.lowercase()
                                 
-                                if ((status == "live" || status == "ns" || status == "pst") && title.contains(query, ignoreCase = true)) {
+                                if (status == "live" && title.contains(query, ignoreCase = true)) {
                                     val isLive = status == "live"
                                     val liveLabel = if (!isLive) " [Upcoming]" else ""
                                     val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG

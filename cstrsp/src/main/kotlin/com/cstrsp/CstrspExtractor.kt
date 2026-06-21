@@ -36,6 +36,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     builtInZoomControls                = true
                     displayZoomControls                = false
                     allowContentAccess                 = true
+                    mediaPlaybackRequiresUserGesture   = false
                     mixedContentMode                   = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     userAgentString                    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
                 }
@@ -94,19 +95,39 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
         try {
             val connection = URL(url).openConnection() as HttpURLConnection
-            connection.requestMethod = "HEAD"
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 3000
+            connection.readTimeout = 3000
+            
             headers?.forEach { (key, value) ->
                 connection.setRequestProperty(key, value)
             }
             
-            connection.connect()
-            val contentType = connection.contentType ?: ""
+            // Add WebView cookies
+            val cookieManager = android.webkit.CookieManager.getInstance()
+            val cookies = cookieManager.getCookie(url)
+            if (cookies != null) {
+                connection.setRequestProperty("Cookie", cookies)
+            }
             
+            connection.connect()
+            
+            // Fast Content-Type check
+            val contentType = connection.contentType ?: ""
             if (contentType.contains("mpegurl", ignoreCase = true) || contentType.contains("application/x-mpegurl", ignoreCase = true)) {
                 onResponseCaptured(url, headers ?: mapOf())
+                return
             }
+            
+            // Read only first few bytes to check for #EXTM3U
+            val reader = BufferedReader(InputStreamReader(connection.inputStream))
+            val firstLine = reader.readLine()
+            if (firstLine != null && firstLine.startsWith("#EXTM")) {
+                onResponseCaptured(url, headers ?: mapOf())
+            }
+            reader.close()
         } catch (e: Exception) {
-            // Ignore connection errors for HEAD requests
+            // Ignore connection errors
         }
     }
 }
