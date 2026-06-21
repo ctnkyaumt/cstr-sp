@@ -112,8 +112,10 @@ class Cstrsp : MainAPI() {
             val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
             val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
             
-            parsedMap?.forEach { (category, items) ->
-                if (items is List<*>) {
+            parsedMap?.forEach { (key, value) ->
+                val categoriesMap = if (key == "cdn-live-tv" && value is Map<*, *>) value else mapOf(key to value)
+                categoriesMap.forEach categoryLoop@{ categoryKey, items ->
+                    if (items !is List<*>) return@categoryLoop
                     val matchList = mutableListOf<SearchResponse>()
                     items.forEach { item ->
                         try {
@@ -121,7 +123,7 @@ class Cstrsp : MainAPI() {
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
                             // Include live and upcoming (NS = Not Started)
-                            if (cdnMatch != null && (cdnMatch.status == "live" || cdnMatch.status == "NS")) {
+                            if (cdnMatch != null && (cdnMatch.status?.lowercase() == "live" || cdnMatch.status?.lowercase() == "ns" || cdnMatch.status?.lowercase() == "pst")) {
                                 val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
                                     cdnMatch.event ?: "Unknown Match"
                                 } else {
@@ -129,7 +131,7 @@ class Cstrsp : MainAPI() {
                                 }
                                 
                                 val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
-                                val isLive = cdnMatch.status == "live"
+                                val isLive = cdnMatch.status?.lowercase() == "live"
                                 val liveLabel = if (!isLive) " [Upcoming]" else ""
                                 
                                 matchList.add(
@@ -147,7 +149,7 @@ class Cstrsp : MainAPI() {
                         }
                     }
                     if (matchList.isNotEmpty()) {
-                        homePageLists.add(HomePageList("$category [StreamSports]", matchList))
+                        homePageLists.add(HomePageList("$categoryKey [StreamSports]", matchList))
                     }
                 }
             }
@@ -174,8 +176,10 @@ class Cstrsp : MainAPI() {
         try {
             val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
             val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
-            parsedMap?.forEach { (_, items) ->
-                if (items is List<*>) {
+            parsedMap?.forEach { (key, value) ->
+                val categoriesMap = if (key == "cdn-live-tv" && value is Map<*, *>) value else mapOf(key to value)
+                categoriesMap.forEach categoryLoop@{ _, items ->
+                    if (items !is List<*>) return@categoryLoop
                     items.forEach { item ->
                         try {
                             val matchStr = item?.toJson() ?: ""
@@ -183,9 +187,10 @@ class Cstrsp : MainAPI() {
                             
                             if (cdnMatch != null) {
                                 val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
+                                val status = cdnMatch.status?.lowercase()
                                 
-                                if ((cdnMatch.status == "live" || cdnMatch.status == "NS") && title.contains(query, ignoreCase = true)) {
-                                    val isLive = cdnMatch.status == "live"
+                                if ((status == "live" || status == "ns" || status == "pst") && title.contains(query, ignoreCase = true)) {
+                                    val isLive = status == "live"
                                     val liveLabel = if (!isLive) " [Upcoming]" else ""
                                     val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
                                     

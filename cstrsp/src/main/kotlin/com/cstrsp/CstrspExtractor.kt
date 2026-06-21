@@ -82,24 +82,31 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
     }
 
     private fun fetchAndCheckResponse(url: String, headers: Map<String, String>?, onResponseCaptured: (url: String, headers: Map<String, String>) -> Unit) {
+        if (url.contains(".m3u")) {
+            onResponseCaptured(url, headers ?: mapOf())
+            return
+        }
+        
+        // Skip obvious static assets
+        if (url.endsWith(".js") || url.endsWith(".css") || url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".webp") || url.endsWith(".svg") || url.endsWith(".gif") || url.endsWith(".woff") || url.endsWith(".woff2") || url.endsWith(".ts")) {
+            return
+        }
+
         try {
             val connection = URL(url).openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-
+            connection.requestMethod = "HEAD"
             headers?.forEach { (key, value) ->
                 connection.setRequestProperty(key, value)
             }
-
+            
             connection.connect()
-            val response = BufferedReader(InputStreamReader(connection.inputStream))
-                .lineSequence()
-                .joinToString("\n")
-
-            if (response.startsWith("#EXTM3U")) {
-                onResponseCaptured(connection.url.toString(), headers ?: mapOf())
+            val contentType = connection.contentType ?: ""
+            
+            if (contentType.contains("mpegurl", ignoreCase = true) || contentType.contains("application/x-mpegurl", ignoreCase = true)) {
+                onResponseCaptured(url, headers ?: mapOf())
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            // Ignore connection errors for HEAD requests
         }
     }
 }
