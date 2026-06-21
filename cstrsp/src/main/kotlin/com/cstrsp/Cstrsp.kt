@@ -117,7 +117,7 @@ class Cstrsp : MainAPI() {
                     val matchList = mutableListOf<SearchResponse>()
                     items.forEach { item ->
                         try {
-                            val matchStr = item.toJson()
+                            val matchStr = item?.toJson() ?: ""
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
                             // Include live and upcoming (NS = Not Started)
@@ -178,7 +178,7 @@ class Cstrsp : MainAPI() {
                 if (items is List<*>) {
                     items.forEach { item ->
                         try {
-                            val matchStr = item.toJson()
+                            val matchStr = item?.toJson() ?: ""
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
                             if (cdnMatch != null) {
