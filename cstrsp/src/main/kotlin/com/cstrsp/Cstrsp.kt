@@ -135,7 +135,7 @@ class Cstrsp : MainAPI() {
                         matchList.add(
                             newLiveSearchResponse(
                                 name = "$title [StreamSports]",
-                                url = "ppv://${stream.id}||$embedUrl"
+                                url = "https://ppv.domains/${stream.id}||$embedUrl"
                             ) {
                                 this.posterUrl = posterUrl
                             }
@@ -180,7 +180,7 @@ class Cstrsp : MainAPI() {
                             results.add(
                                 newLiveSearchResponse(
                                     name = "$title [StreamSports]",
-                                    url = "ppv://${stream.id}||$embedUrl"
+                                    url = "https://ppv.domains/${stream.id}||$embedUrl"
                                 ) {
                                     this.posterUrl = posterUrl
                                 }
@@ -196,12 +196,12 @@ class Cstrsp : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         // Handle PPV Streams
-        if (url.startsWith("ppv://")) {
+        if (url.contains("ppv.domains/")) {
             val embedUrl = url.substringAfter("||")
             return newLiveStreamLoadResponse(
                 name = "Live Stream",
                 url = url,
-                dataUrl = "ppvextract||$embedUrl"
+                dataUrl = "https://ppvextract.domains/||$embedUrl"
             )
         }
 
@@ -251,7 +251,7 @@ class Cstrsp : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         // Handle PPV Extract
-        if (data.startsWith("ppvextract||")) {
+        if (data.contains("ppvextract.domains/||")) {
             val embedUrl = data.substringAfter("||")
             loadExtractor(embedUrl, "https://embedindia.st/", subtitleCallback) { link ->
                 callback(
