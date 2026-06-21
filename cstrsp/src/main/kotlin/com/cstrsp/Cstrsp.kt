@@ -1,9 +1,11 @@
 package com.cstrsp
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.loadExtractor
 import com.fasterxml.jackson.annotation.JsonProperty
 
 class Cstrsp : MainAPI() {
@@ -15,6 +17,7 @@ class Cstrsp : MainAPI() {
     override val supportedTypes = setOf(TvType.Live)
 
     private val apiUrl = "https://streamed.pk/api"
+    private val cdnApiUrl = "https://api.cdnlivetv.tv/api/v1"
 
     data class APIMatch(
         @JsonProperty("id") val id: String,
@@ -51,7 +54,28 @@ class Cstrsp : MainAPI() {
         @JsonProperty("source") val source: String
     )
 
-    // Helper to fetch matches from an endpoint, returning empty list on failure
+    data class CDNMatch(
+        @JsonProperty("gameID") val gameID: String,
+        @JsonProperty("event") val event: String?,
+        @JsonProperty("homeTeam") val homeTeam: String?,
+        @JsonProperty("awayTeam") val awayTeam: String?,
+        @JsonProperty("homeTeamIMG") val homeTeamIMG: String?,
+        @JsonProperty("awayTeamIMG") val awayTeamIMG: String?,
+        @JsonProperty("time") val time: String?,
+        @JsonProperty("tournament") val tournament: String?,
+        @JsonProperty("country") val country: String?,
+        @JsonProperty("countryIMG") val countryIMG: String?,
+        @JsonProperty("status") val status: String?, // "live", "NS", etc.
+        @JsonProperty("channels") val channels: List<CDNChannel>? = null
+    )
+
+    data class CDNChannel(
+        @JsonProperty("channel_name") val channel_name: String?,
+        @JsonProperty("channel_code") val channel_code: String?,
+        @JsonProperty("url") val url: String?
+    )
+
+    // Helper to fetch matches from streamed.pk
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> {
         return try {
             app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
@@ -61,81 +85,154 @@ class Cstrsp : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Try live matches first
-        var matches = fetchMatches("$apiUrl/matches/live")
-        var isLive = true
+        val homePageLists = mutableListOf<HomePageList>()
 
-        // Fallback to today's matches if live is empty
-        if (matches.isEmpty()) {
-            matches = fetchMatches("$apiUrl/matches/all-today")
-            isLive = false
+        // 1. Fetch Streamed.pk (Main Source)
+        val mainMatches = fetchMatches("$apiUrl/matches/live")
+        mainMatches.groupBy { it.category }.forEach { (category, matches) ->
+            val list = matches.mapNotNull { match ->
+                val posterUrl = if (match.poster != null) {
+                    "$mainUrl${match.poster}"
+                } else if (match.teams?.home?.badge != null) {
+                    "$apiUrl/images/badge/${match.teams.home.badge}.webp"
+                } else {
+                    null
+                }
+                newLiveSearchResponse(match.title, "$mainUrl/match/${match.id}") {
+                    this.posterUrl = posterUrl
+                }
+            }
+            if (list.isNotEmpty()) {
+                homePageLists.add(HomePageList("${category.replaceFirstChar { it.uppercase() }} [Streamed]", list))
+            }
         }
 
-        // Group by category to create rows on the homepage
-        val grouped = matches.groupBy { it.category }
-
-        val homePageLists = grouped.map { (category, categoryMatches) ->
-            val list = categoryMatches.mapNotNull { match ->
-                toSearchResponse(match, isLive)
+        // 2. Fetch CDN Live TV (Backup Source)
+        try {
+            val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
+            val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
+            
+            parsedMap.forEach { (category, items) ->
+                if (items is List<*>) {
+                    val matchList = mutableListOf<SearchResponse>()
+                    items.forEach { item ->
+                        try {
+                            val matchStr = AppUtils.toJson(item)
+                            val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
+                            
+                            // Include live and upcoming (NS = Not Started)
+                            if (cdnMatch.status == "live" || cdnMatch.status == "NS") {
+                                val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
+                                    cdnMatch.event ?: "Unknown Match"
+                                } else {
+                                    "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
+                                }
+                                
+                                val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+                                val isLive = cdnMatch.status == "live"
+                                val liveLabel = if (!isLive) " [Upcoming]" else ""
+                                
+                                matchList.add(
+                                    newLiveSearchResponse(
+                                        name = "$title [StreamSports]$liveLabel",
+                                        // Pass the match JSON embedded in the URL so load() can parse it instantly
+                                        url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
+                                    ) {
+                                        this.posterUrl = posterUrl
+                                    }
+                                )
+                            }
+                        } catch (e: Exception) {
+                            // Ignore parsing errors for individual items
+                        }
+                    }
+                    if (matchList.isNotEmpty()) {
+                        homePageLists.add(HomePageList("$category [StreamSports]", matchList))
+                    }
+                }
             }
-            val label = if (isLive) {
-                category.replaceFirstChar { it.uppercase() }
-            } else {
-                "${category.replaceFirstChar { it.uppercase() }} [Upcoming]"
-            }
-            HomePageList(label, list)
+        } catch (e: Exception) {
+            // Backup source failed
         }
 
         return newHomePageResponse(homePageLists)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Search live matches first
-        val liveMatches = fetchMatches("$apiUrl/matches/live")
-        val results = liveMatches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
-            toSearchResponse(match, isLive = true)
-        }.toMutableList()
+        val results = mutableListOf<SearchResponse>()
+        
+        // Search Streamed.pk
+        val mainMatches = fetchMatches("$apiUrl/matches/live")
+        results.addAll(mainMatches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
+            val posterUrl = if (match.poster != null) "$mainUrl${match.poster}" else if (match.teams?.home?.badge != null) "$apiUrl/images/badge/${match.teams.home.badge}.webp" else null
+            newLiveSearchResponse(match.title, "$mainUrl/match/${match.id}") {
+                this.posterUrl = posterUrl
+            }
+        })
 
-        // Also search today's matches for broader results
-        if (results.isEmpty()) {
-            val todayMatches = fetchMatches("$apiUrl/matches/all-today")
-            results.addAll(todayMatches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
-                toSearchResponse(match, isLive = false)
-            })
-        }
+        // Search CDN Live TV (Backup)
+        try {
+            val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
+            val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
+            parsedMap.forEach { (_, items) ->
+                if (items is List<*>) {
+                    items.forEach { item ->
+                        try {
+                            val matchStr = AppUtils.toJson(item)
+                            val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
+                            val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
+                            
+                            if ((cdnMatch.status == "live" || cdnMatch.status == "NS") && title.contains(query, ignoreCase = true)) {
+                                val isLive = cdnMatch.status == "live"
+                                val liveLabel = if (!isLive) " [Upcoming]" else ""
+                                val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+                                
+                                results.add(
+                                    newLiveSearchResponse(
+                                        name = "$title [StreamSports]$liveLabel",
+                                        url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
+                                    ) {
+                                        this.posterUrl = posterUrl
+                                    }
+                                )
+                            }
+                        } catch (e: Exception) {}
+                    }
+                }
+            }
+        } catch (e: Exception) {}
 
         return results
     }
 
-    private fun toSearchResponse(match: APIMatch, isLive: Boolean): SearchResponse? {
-        val posterUrl = if (match.poster != null) {
-            "$mainUrl${match.poster}"
-        } else if (match.teams?.home?.badge != null) {
-            "$apiUrl/images/badge/${match.teams.home.badge}.webp"
-        } else {
-            null
-        }
-
-        // Build title with source names
-        val sourceNames = match.sources?.joinToString(", ") { src ->
-            src.source.replaceFirstChar { it.uppercase() }
-        } ?: ""
-        val sourceLabel = if (sourceNames.isNotEmpty()) " [$sourceNames]" else ""
-        val liveLabel = if (!isLive) " [Upcoming]" else ""
-        val displayTitle = "${match.title}$sourceLabel$liveLabel"
-
-        return newLiveSearchResponse(
-            name = displayTitle,
-            url = "$mainUrl/match/${match.id}" // Pass match URL
-        ) {
-            this.posterUrl = posterUrl
-        }
-    }
-
     override suspend fun load(url: String): LoadResponse? {
-        val matchId = url.substringAfterLast("/")
+        // Handle CDN Live TV (Backup Source) URL format
+        if (url.startsWith("cdnlivetv://")) {
+            val data = url.substringAfter("||")
+            val cdnMatch = AppUtils.parseJson<CDNMatch>(data)
+            
+            val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
+                cdnMatch.event ?: "Unknown Match"
+            } else {
+                "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
+            }
+            val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+            val isLive = cdnMatch.status == "live"
+            val liveLabel = if (!isLive) " [Upcoming]" else ""
 
-        // Try live first, then all-today
+            return newLiveStreamLoadResponse(
+                name = "$title [StreamSports]$liveLabel",
+                url = url,
+                // Pass channels array as JSON to loadLinks
+                dataUrl = AppUtils.toJson(cdnMatch.channels ?: emptyList<CDNChannel>())
+            ) {
+                this.posterUrl = posterUrl
+                this.plot = if (isLive) "Live stream for $title" else "Upcoming: $title"
+            }
+        }
+
+        // Handle Streamed.pk (Main Source) URL format
+        val matchId = url.substringAfterLast("/")
         var matches = fetchMatches("$apiUrl/matches/live")
         var match = matches.find { it.id == matchId }
         var isLive = true
@@ -156,7 +253,6 @@ class Cstrsp : MainAPI() {
             null
         }
 
-        // Build title with source names
         val sourceNames = match.sources?.joinToString(", ") { src ->
             src.source.replaceFirstChar { it.uppercase() }
         } ?: ""
@@ -180,6 +276,37 @@ class Cstrsp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Try parsing as CDN Live TV (Backup Source) channels first
+        try {
+            val cdnChannels = AppUtils.parseJson<List<CDNChannel>>(data)
+            if (cdnChannels.isNotEmpty() && cdnChannels[0].channel_name != null) {
+                cdnChannels.forEachIndexed { index, channel ->
+                    val url = channel.url ?: return@forEachIndexed
+                    val name = channel.channel_name ?: "StreamSports Channel ${index + 1}"
+                    
+                    // Route to our CstrspExtractor
+                    loadExtractor(url, "https://api.cdnlivetv.tv/", subtitleCallback) { link ->
+                        callback(
+                            ExtractorLink(
+                                source = "StreamSports",
+                                name = name,
+                                url = link.url,
+                                referer = link.referer,
+                                quality = link.quality,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData
+                            )
+                        )
+                    }
+                }
+                return true
+            }
+        } catch (e: Exception) {
+            // Not CDNChannels, continue to APISource
+        }
+
+        // Try parsing as Streamed.pk (Main Source) sources
         val sources = try {
             AppUtils.parseJson<List<APISource>>(data)
         } catch (e: Exception) {
@@ -200,61 +327,31 @@ class Cstrsp : MainAPI() {
                         val name = "$sourceName - $langStr"
                         val embedUrl = stream.embedUrl
 
-                        // The embedUrl is an HTML player page (embed.st), not a direct stream.
-                        // Try CloudStream's built-in extractors first.
-                        var extractorFound = false
-                        try {
-                            extractorFound = loadExtractor(
-                                embedUrl,
-                                "$mainUrl/",
-                                subtitleCallback
-                            ) { link ->
-                                // Re-wrap with proper headers to prevent 403 errors
-                                val newHeaders = (link.headers).toMutableMap()
-                                newHeaders["Referer"] = "$mainUrl/"
-                                newHeaders["Origin"] = mainUrl
+                        // Pass the embed URL to our WebView extractor (or built-in extractors)
+                        loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
+                            val newHeaders = link.headers.toMutableMap()
+                            newHeaders["Referer"] = "$mainUrl/"
+                            newHeaders["Origin"] = mainUrl
 
-                                callback.invoke(
-                                    ExtractorLink(
-                                        source = "$name - Stream ${stream.streamNo}",
-                                        name = "$name - Stream ${stream.streamNo}",
-                                        url = link.url,
-                                        referer = "$mainUrl/",
-                                        quality = quality,
-                                        type = link.type,
-                                        headers = newHeaders,
-                                        extractorData = link.extractorData
-                                    )
-                                )
-                            }
-                        } catch (e: Exception) {
-                            extractorFound = false
-                        }
-
-                        // Fallback: provide the embed URL as a VIDEO type link
-                        // CloudStream's WebView player can handle HTML embed pages
-                        if (!extractorFound) {
-                            callback(
-                                newExtractorLink(
-                                    source = name,
+                            callback.invoke(
+                                ExtractorLink(
+                                    source = "$name - Stream ${stream.streamNo}",
                                     name = "$name - Stream ${stream.streamNo}",
-                                    url = embedUrl,
-                                    type = ExtractorLinkType.VIDEO
-                                ) {
-                                    this.headers = mapOf(
-                                        "Referer" to "$mainUrl/",
-                                        "Origin" to mainUrl
-                                    )
-                                    this.quality = quality
-                                }
+                                    url = link.url,
+                                    referer = "$mainUrl/",
+                                    quality = quality,
+                                    type = link.type,
+                                    headers = newHeaders,
+                                    extractorData = link.extractorData
+                                )
                             )
                         }
                     } catch (e: Exception) {
-                        // Skip this individual stream but continue with others
+                        // Skip stream
                     }
                 }
             } catch (e: Exception) {
-                // Skip this source but continue with others
+                // Skip source
             }
         }
 

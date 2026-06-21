@@ -8,5 +8,9 @@ import android.content.Context
 class CstrspPlugin: Plugin() {
     override fun load(context: Context) {
         registerMainAPI(Cstrsp())
+        registerExtractorAPI(CstrspExtractor("https://embed.st/", context))
+        registerExtractorAPI(CstrspExtractor("https://embedme.top/", context))
+        registerExtractorAPI(CstrspExtractor("https://strwish.com/", context))
+        registerExtractorAPI(CstrspExtractor("https://cdnlivetv.tv/", context))
     }
 }
