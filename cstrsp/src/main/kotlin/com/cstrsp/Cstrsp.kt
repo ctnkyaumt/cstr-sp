@@ -1,8 +1,7 @@
 package com.cstrsp
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -112,7 +111,7 @@ class Cstrsp : MainAPI() {
             val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
             val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
             
-            parsedMap.forEach { (category, items) ->
+            parsedMap?.forEach { (category, items) ->
                 if (items is List<*>) {
                     val matchList = mutableListOf<SearchResponse>()
                     items.forEach { item ->
@@ -121,7 +120,7 @@ class Cstrsp : MainAPI() {
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
                             
                             // Include live and upcoming (NS = Not Started)
-                            if (cdnMatch.status == "live" || cdnMatch.status == "NS") {
+                            if (cdnMatch != null && (cdnMatch.status == "live" || cdnMatch.status == "NS")) {
                                 val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
                                     cdnMatch.event ?: "Unknown Match"
                                 } else {
@@ -174,27 +173,30 @@ class Cstrsp : MainAPI() {
         try {
             val cdnJson = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").text
             val parsedMap = AppUtils.parseJson<Map<String, Any>>(cdnJson)
-            parsedMap.forEach { (_, items) ->
+            parsedMap?.forEach { (_, items) ->
                 if (items is List<*>) {
                     items.forEach { item ->
                         try {
                             val matchStr = AppUtils.toJson(item)
                             val cdnMatch = AppUtils.parseJson<CDNMatch>(matchStr)
-                            val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
                             
-                            if ((cdnMatch.status == "live" || cdnMatch.status == "NS") && title.contains(query, ignoreCase = true)) {
-                                val isLive = cdnMatch.status == "live"
-                                val liveLabel = if (!isLive) " [Upcoming]" else ""
-                                val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+                            if (cdnMatch != null) {
+                                val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) cdnMatch.event ?: "Unknown" else "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
                                 
-                                results.add(
-                                    newLiveSearchResponse(
-                                        name = "$title [StreamSports]$liveLabel",
-                                        url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
-                                    ) {
-                                        this.posterUrl = posterUrl
-                                    }
-                                )
+                                if ((cdnMatch.status == "live" || cdnMatch.status == "NS") && title.contains(query, ignoreCase = true)) {
+                                    val isLive = cdnMatch.status == "live"
+                                    val liveLabel = if (!isLive) " [Upcoming]" else ""
+                                    val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+                                    
+                                    results.add(
+                                        newLiveSearchResponse(
+                                            name = "$title [StreamSports]$liveLabel",
+                                            url = "cdnlivetv://${cdnMatch.gameID}||$matchStr"
+                                        ) {
+                                            this.posterUrl = posterUrl
+                                        }
+                                    )
+                                }
                             }
                         } catch (e: Exception) {}
                     }
@@ -211,23 +213,25 @@ class Cstrsp : MainAPI() {
             val data = url.substringAfter("||")
             val cdnMatch = AppUtils.parseJson<CDNMatch>(data)
             
-            val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
-                cdnMatch.event ?: "Unknown Match"
-            } else {
-                "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
-            }
-            val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
-            val isLive = cdnMatch.status == "live"
-            val liveLabel = if (!isLive) " [Upcoming]" else ""
-
-            return newLiveStreamLoadResponse(
-                name = "$title [StreamSports]$liveLabel",
-                url = url,
-                // Pass channels array as JSON to loadLinks
-                dataUrl = AppUtils.toJson(cdnMatch.channels ?: emptyList<CDNChannel>())
-            ) {
-                this.posterUrl = posterUrl
-                this.plot = if (isLive) "Live stream for $title" else "Upcoming: $title"
+            if (cdnMatch != null) {
+                val title = if (cdnMatch.homeTeam.isNullOrEmpty() || cdnMatch.awayTeam.isNullOrEmpty()) {
+                    cdnMatch.event ?: "Unknown Match"
+                } else {
+                    "${cdnMatch.homeTeam} vs ${cdnMatch.awayTeam}"
+                }
+                val posterUrl = cdnMatch.homeTeamIMG ?: cdnMatch.awayTeamIMG
+                val isLive = cdnMatch.status == "live"
+                val liveLabel = if (!isLive) " [Upcoming]" else ""
+    
+                return newLiveStreamLoadResponse(
+                    name = "$title [StreamSports]$liveLabel",
+                    url = url,
+                    // Pass channels array as JSON to loadLinks
+                    dataUrl = AppUtils.toJson(cdnMatch.channels ?: emptyList<CDNChannel>())
+                ) {
+                    this.posterUrl = posterUrl
+                    this.plot = if (isLive) "Live stream for $title" else "Upcoming: $title"
+                }
             }
         }
 
@@ -263,7 +267,7 @@ class Cstrsp : MainAPI() {
         return newLiveStreamLoadResponse(
             name = displayTitle,
             url = url,
-            dataUrl = (match.sources ?: emptyList<APISource>()).toJson()
+            dataUrl = AppUtils.toJson(match.sources ?: emptyList<APISource>())
         ) {
             this.posterUrl = posterUrl
             this.plot = if (isLive) "Live stream for ${match.title}" else "Upcoming: ${match.title}"
@@ -279,9 +283,9 @@ class Cstrsp : MainAPI() {
         // Try parsing as CDN Live TV (Backup Source) channels first
         try {
             val cdnChannels = AppUtils.parseJson<List<CDNChannel>>(data)
-            if (cdnChannels.isNotEmpty() && cdnChannels[0].channel_name != null) {
-                cdnChannels.forEachIndexed { index, channel ->
-                    val url = channel.url ?: return@forEachIndexed
+            if (!cdnChannels.isNullOrEmpty() && cdnChannels[0].channel_name != null) {
+                for ((index, channel) in cdnChannels.withIndex()) {
+                    val url = channel.url ?: continue
                     val name = channel.channel_name ?: "StreamSports Channel ${index + 1}"
                     
                     // Route to our CstrspExtractor
@@ -313,45 +317,47 @@ class Cstrsp : MainAPI() {
             return false
         }
 
-        sources.forEach { source ->
-            try {
-                val streams = app.get("$apiUrl/stream/${source.source}/${source.id}")
-                    .parsedSafe<Array<APIStream>>()?.toList() ?: emptyList()
-
-                streams.forEach { stream ->
-                    try {
-                        val isHD = stream.hd
-                        val langStr = stream.language ?: "Unknown"
-                        val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
-                        val sourceName = source.source.replaceFirstChar { it.uppercase() }
-                        val name = "$sourceName - $langStr"
-                        val embedUrl = stream.embedUrl
-
-                        // Pass the embed URL to our WebView extractor (or built-in extractors)
-                        loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
-                            val newHeaders = link.headers.toMutableMap()
-                            newHeaders["Referer"] = "$mainUrl/"
-                            newHeaders["Origin"] = mainUrl
-
-                            callback.invoke(
-                                ExtractorLink(
-                                    source = "$name - Stream ${stream.streamNo}",
-                                    name = "$name - Stream ${stream.streamNo}",
-                                    url = link.url,
-                                    referer = "$mainUrl/",
-                                    quality = quality,
-                                    type = link.type,
-                                    headers = newHeaders,
-                                    extractorData = link.extractorData
+        if (sources != null) {
+            for (source in sources) {
+                try {
+                    val streams = app.get("$apiUrl/stream/${source.source}/${source.id}")
+                        .parsedSafe<Array<APIStream>>()?.toList() ?: emptyList()
+    
+                    for (stream in streams) {
+                        try {
+                            val isHD = stream.hd
+                            val langStr = stream.language ?: "Unknown"
+                            val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
+                            val sourceName = source.source.replaceFirstChar { it.uppercase() }
+                            val name = "$sourceName - $langStr"
+                            val embedUrl = stream.embedUrl
+    
+                            // Pass the embed URL to our WebView extractor (or built-in extractors)
+                            loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
+                                val newHeaders = link.headers.toMutableMap()
+                                newHeaders["Referer"] = "$mainUrl/"
+                                newHeaders["Origin"] = mainUrl
+    
+                                callback.invoke(
+                                    ExtractorLink(
+                                        source = "$name - Stream ${stream.streamNo}",
+                                        name = "$name - Stream ${stream.streamNo}",
+                                        url = link.url,
+                                        referer = "$mainUrl/",
+                                        quality = quality,
+                                        type = link.type,
+                                        headers = newHeaders,
+                                        extractorData = link.extractorData
+                                    )
                                 )
-                            )
+                            }
+                        } catch (e: Exception) {
+                            // Skip stream
                         }
-                    } catch (e: Exception) {
-                        // Skip stream
                     }
+                } catch (e: Exception) {
+                    // Skip source
                 }
-            } catch (e: Exception) {
-                // Skip source
             }
         }
 
