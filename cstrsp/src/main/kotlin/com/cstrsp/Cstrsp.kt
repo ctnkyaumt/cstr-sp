@@ -156,6 +156,15 @@ class Cstrsp : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
         
+        results.add(
+            newLiveSearchResponse(
+                name = "TRT Yayını",
+                url = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
+            ) {
+                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/1/14/TRT_1_logo.svg/1200px-TRT_1_logo.svg.png"
+            }
+        )
+
         // Search Streamed.pk
         val mainMatches = fetchMatches("$apiUrl/matches/live")
         results.addAll(mainMatches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
@@ -195,6 +204,17 @@ class Cstrsp : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        if (url == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
+            return newLiveStreamLoadResponse(
+                name = "TRT Yayını",
+                url = url,
+                dataUrl = url
+            ) {
+                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/1/14/TRT_1_logo.svg/1200px-TRT_1_logo.svg.png"
+                this.plot = "TRT Yayını Live Stream"
+            }
+        }
+
         // Handle PPV Streams
         if (url.contains("ppv.domains/")) {
             val embedUrl = url.substringAfter("||")
@@ -250,6 +270,20 @@ class Cstrsp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        if (data == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
+            callback.invoke(
+                ExtractorLink(
+                    source = "TRT",
+                    name = "TRT Yayını",
+                    url = data,
+                    referer = "",
+                    quality = Qualities.Unknown.value,
+                    isM3u8 = true
+                )
+            )
+            return true
+        }
+
         // Handle PPV Extract
         if (data.contains("ppvextract.domains/||")) {
             val embedUrl = data.substringAfter("||")
