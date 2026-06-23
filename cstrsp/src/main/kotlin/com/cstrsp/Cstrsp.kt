@@ -161,7 +161,7 @@ class Cstrsp : MainAPI() {
                 name = "TRT Yayını",
                 url = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
             ) {
-                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/1/14/TRT_1_logo.svg/1200px-TRT_1_logo.svg.png"
+                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
             }
         )
 
@@ -210,7 +210,7 @@ class Cstrsp : MainAPI() {
                 url = url,
                 dataUrl = url
             ) {
-                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/1/14/TRT_1_logo.svg/1200px-TRT_1_logo.svg.png"
+                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
                 this.plot = "TRT Yayını Live Stream"
             }
         }
