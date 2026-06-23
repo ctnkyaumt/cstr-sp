@@ -272,7 +272,7 @@ class Cstrsp : MainAPI() {
     ): Boolean {
         if (data == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
             callback.invoke(
-                ExtractorLink(
+                newExtractorLink(
                     source = "TRT",
                     name = "TRT Yayını",
                     url = data,
