@@ -271,7 +271,6 @@ class Cstrsp : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (data == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
-            @Suppress("DEPRECATION")
             callback.invoke(
                 ExtractorLink(
                     source = "TRT",
@@ -279,7 +278,7 @@ class Cstrsp : MainAPI() {
                     url = data,
                     referer = "",
                     quality = Qualities.Unknown.value,
-                    isM3u8 = true
+                    type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8
                 )
             )
             return true
