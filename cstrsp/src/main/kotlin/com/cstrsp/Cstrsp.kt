@@ -271,8 +271,9 @@ class Cstrsp : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (data == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
+            @Suppress("DEPRECATION")
             callback.invoke(
-                newExtractorLink(
+                ExtractorLink(
                     source = "TRT",
                     name = "TRT Yayını",
                     url = data,
