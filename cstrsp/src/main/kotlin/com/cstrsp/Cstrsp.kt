@@ -57,58 +57,29 @@ class Cstrsp : MainAPI() {
     data class PPVStream(
         @JsonProperty("id") val id: Int? = null,
         @JsonProperty("name") val name: String? = null,
-        @JsonProperty("tag") val tag: String? = null,
         @JsonProperty("poster") val poster: String? = null,
-        @JsonProperty("uri_name") val uriName: String? = null,
-        @JsonProperty("starts_at") val startsAt: Long? = null,
-        @JsonProperty("ends_at") val endsAt: Long? = null,
-        @JsonProperty("always_live") val alwaysLive: Int? = null,
-        @JsonProperty("category_name") val categoryName: String? = null,
-        @JsonProperty("iframe") val iframe: String? = null,
-        @JsonProperty("viewers") val viewers: String? = null
+        @JsonProperty("iframe") val iframe: String? = null
     )
 
     data class PPVCategory(
+        @JsonProperty("category_name") val category_name: String? = null,
         @JsonProperty("category") val category: String? = null,
-        @JsonProperty("id") val id: Int? = null,
-        @JsonProperty("always_live") val alwaysLive: Boolean? = null,
         @JsonProperty("streams") val streams: List<PPVStream>? = null
     )
 
     data class PPVResponse(
-        @JsonProperty("success") val success: Boolean? = null,
-        @JsonProperty("timestamp") val timestamp: Long? = null,
         @JsonProperty("streams") val streams: List<PPVCategory>? = null
     )
 
-    data class PPVPingResponse(
-        @JsonProperty("success") val success: Boolean? = null,
-        @JsonProperty("domains") val domains: List<String>? = null
-    )
-
-    private val ppvDomains = listOf("api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
-
-    private suspend fun discoverPPVDomains(): List<String> {
-        for (domain in ppvDomains) {
-            try {
-                val response = app.get("https://$domain/api/ping", timeout = 5L).text
-                val ping = AppUtils.parseJson<PPVPingResponse>(response)
-                if (ping?.success == true && ping.domains != null) {
-                    return ping.domains.map { "api.$it" }
-                }
-            } catch (e: Exception) {}
-        }
-        return ppvDomains
-    }
+    private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
 
     private suspend fun fetchPPVApi(): PPVResponse? {
-        val domains = discoverPPVDomains()
-        for (domain in domains) {
+        for (domain in ppvDomains) {
             try {
                 val url = "https://$domain/api/streams"
-                val response = app.get(url, timeout = 10L).text
+                val response = app.get(url, timeout = 3L).text
                 val parsed = AppUtils.parseJson<PPVResponse>(response)
-                if (parsed?.success == true && parsed.streams != null) {
+                if (parsed?.streams != null) {
                     return parsed
                 }
             } catch (e: Exception) {}
@@ -152,19 +123,18 @@ class Cstrsp : MainAPI() {
         try {
             val ppvRes = fetchPPVApi()
             ppvRes?.streams?.forEach { category ->
-                val catName = category.category ?: "Unknown"
+                val catName = category.category_name ?: category.category ?: "Unknown"
                 val matchList = mutableListOf<SearchResponse>()
                 
                 category.streams?.forEach { stream ->
                     val title = stream.name ?: "Unknown Event"
-                    val tagStr = if (stream.tag != null) " (${stream.tag})" else ""
                     val posterUrl = stream.poster
                     val embedUrl = stream.iframe
                     
                     if (embedUrl != null) {
                         matchList.add(
                             newLiveSearchResponse(
-                                name = "$title$tagStr [StreamSports]",
+                                name = "$title [StreamSports]",
                                 url = "https://ppv.domains/${stream.id}||$embedUrl"
                             ) {
                                 this.posterUrl = posterUrl
@@ -210,7 +180,6 @@ class Cstrsp : MainAPI() {
             ppvRes?.streams?.forEach { category ->
                 category.streams?.forEach { stream ->
                     val title = stream.name ?: "Unknown Event"
-                    val tagStr = if (stream.tag != null) " (${stream.tag})" else ""
                     
                     if (title.contains(query, ignoreCase = true)) {
                         val posterUrl = stream.poster
@@ -219,7 +188,7 @@ class Cstrsp : MainAPI() {
                         if (embedUrl != null) {
                             results.add(
                                 newLiveSearchResponse(
-                                    name = "$title$tagStr [StreamSports]",
+                                    name = "$title [StreamSports]",
                                     url = "https://ppv.domains/${stream.id}||$embedUrl"
                                 ) {
                                     this.posterUrl = posterUrl
