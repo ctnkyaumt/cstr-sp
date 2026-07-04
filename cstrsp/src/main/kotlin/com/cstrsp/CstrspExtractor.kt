@@ -24,6 +24,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
     @SuppressLint("SetJavaScriptEnabled")
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        var isDone = false
         withContext(Dispatchers.Main) {
             webView = WebView(context).apply {
                 settings.apply {
@@ -42,16 +43,18 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
                 webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        if (isDone) return super.shouldInterceptRequest(view, request)
+                        
                         val method = request?.method ?: "GET"
                         if (method.uppercase() != "GET") {
                             return super.shouldInterceptRequest(view, request)
                         }
 
-                        @Suppress("NAME_SHADOWING") val url = request?.url.toString()
+                        @Suppress("NAME_SHADOWING") val reqUrl = request?.url.toString()
                         val headers = request?.requestHeaders?.toMutableMap() ?: mutableMapOf()
                         
                         // Add WebView cookies to the headers so ExoPlayer can use them
-                        val cookie = android.webkit.CookieManager.getInstance().getCookie(url)
+                        val cookie = android.webkit.CookieManager.getInstance().getCookie(reqUrl)
                         if (cookie != null) {
                             headers["Cookie"] = cookie
                         }
@@ -62,18 +65,21 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         }
 
                         Thread {
-                            fetchAndCheckResponse(url, headers) { sourceUrl, outHeaders ->
-                                callback.invoke(
-                                    ExtractorLink(
-                                        source  = this@CstrspExtractor.name,
-                                        name    = this@CstrspExtractor.name,
-                                        url     = sourceUrl,
-                                        referer = outHeaders["Referer"] ?: outHeaders["referer"] ?: mainUrl,
-                                        quality = Qualities.Unknown.value,
-                                        type    = ExtractorLinkType.M3U8,
-                                        headers = outHeaders
+                            fetchAndCheckResponse(reqUrl, headers) { sourceUrl, outHeaders ->
+                                if (!isDone) {
+                                    isDone = true
+                                    callback.invoke(
+                                        ExtractorLink(
+                                            source  = this@CstrspExtractor.name,
+                                            name    = this@CstrspExtractor.name,
+                                            url     = sourceUrl,
+                                            referer = outHeaders["Referer"] ?: outHeaders["referer"] ?: mainUrl,
+                                            quality = Qualities.Unknown.value,
+                                            type    = ExtractorLinkType.M3U8,
+                                            headers = outHeaders
+                                        )
                                     )
-                                )
+                                }
                             }
                         }.start()
 
@@ -89,7 +95,19 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
             }
         }
 
-        delay(10_000)
+        try {
+            var waitTime = 0
+            while (!isDone && waitTime < 15000) {
+                delay(200)
+                waitTime += 200
+            }
+        } finally {
+            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                try {
+                    webView.destroy()
+                } catch (e: Exception) {}
+            }
+        }
     }
 
     private fun fetchAndCheckResponse(url: String, headers: Map<String, String>?, onResponseCaptured: (url: String, headers: Map<String, String>) -> Unit) {
