@@ -57,7 +57,7 @@ class Cstrsp : MainAPI() {
 
     data class APITeam(
         @JsonProperty("name") val name: String,
-        @JsonProperty("badge") val badge: String
+        @JsonProperty("badge") val badge: String? = null
     )
 
     data class APISource(
@@ -188,8 +188,14 @@ class Cstrsp : MainAPI() {
         )
 
         // Search Streamed.pk
-        val mainMatches = fetchMatches("$apiUrl/matches/live")
-        results.addAll(mainMatches.filter { it.title.contains(query, ignoreCase = true) }.mapNotNull { match ->
+        val liveMatches = fetchMatches("$apiUrl/matches/live")
+        val todayMatches = fetchMatches("$apiUrl/matches/all-today")
+        val allMatches = (liveMatches + todayMatches).distinctBy { it.id }
+        
+        val queryParts = query.split(" ").filter { it.isNotBlank() }
+        results.addAll(allMatches.filter { match -> 
+            queryParts.all { match.title.contains(it, ignoreCase = true) }
+        }.mapNotNull { match ->
             val posterUrl = if (match.poster != null) "$mainUrl${match.poster}" else if (match.teams?.home?.badge != null) "$apiUrl/images/badge/${match.teams.home.badge}.webp" else null
             newLiveSearchResponse(match.title, "$mainUrl/match/${match.id}") {
                 this.posterUrl = posterUrl
