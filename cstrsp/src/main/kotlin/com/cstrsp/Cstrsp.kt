@@ -281,7 +281,7 @@ class Cstrsp : MainAPI() {
             return newLiveStreamLoadResponse(
                 name = title,
                 url = url,
-                dataUrl = foundStream?.toJson()
+                dataUrl = foundStream!!.toJson()
             ) {
                 this.posterUrl = posterUrl
                 this.plot = title
