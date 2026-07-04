@@ -16,8 +16,28 @@ class Cstrsp : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Live)
 
-    private val apiUrl = "https://streamed.pk/api"
+    private var apiUrl = "https://streamed.pk/api"
     private val cdnApiUrl = "https://api.cdnlivetv.tv/api/v1"
+    private var isDomainChecked = false
+    private val domains = listOf("https://streamed.pk", "https://streamed.st")
+
+    private suspend fun checkAndGetDomain() {
+        if (isDomainChecked) return
+        for (domain in domains) {
+            try {
+                val response = app.get("$domain/api/matches/live", timeout = 5L)
+                if (response.code in 200..299) {
+                    mainUrl = domain
+                    apiUrl = "$domain/api"
+                    isDomainChecked = true
+                    return
+                }
+            } catch (e: Exception) {}
+        }
+        mainUrl = domains.first()
+        apiUrl = "${domains.first()}/api"
+        isDomainChecked = true
+    }
 
     data class APIMatch(
         @JsonProperty("id") val id: String,
@@ -97,6 +117,7 @@ class Cstrsp : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        checkAndGetDomain()
         val homePageLists = mutableListOf<HomePageList>()
 
         // 1. Fetch Streamed.pk (Main Source)
@@ -154,6 +175,7 @@ class Cstrsp : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        checkAndGetDomain()
         val results = mutableListOf<SearchResponse>()
         
         results.add(
@@ -204,6 +226,7 @@ class Cstrsp : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        checkAndGetDomain()
         if (url == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
             return newLiveStreamLoadResponse(
                 name = "TRT Yayını",
@@ -270,6 +293,7 @@ class Cstrsp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        checkAndGetDomain()
         if (data == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
             callback.invoke(
                 ExtractorLink(
