@@ -74,11 +74,22 @@ class Cstrsp : MainAPI() {
         @JsonProperty("source") val source: String
     )
 
+    data class PPVSubstream(
+        @JsonProperty("id") val id: Int? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("source_tag") val source_tag: String? = null,
+        @JsonProperty("locale") val locale: String? = null,
+        @JsonProperty("iframe") val iframe: String? = null,
+        @JsonProperty("uri_name") val uri_name: String? = null
+    )
+
     data class PPVStream(
         @JsonProperty("id") val id: Int? = null,
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("poster") val poster: String? = null,
-        @JsonProperty("iframe") val iframe: String? = null
+        @JsonProperty("iframe") val iframe: String? = null,
+        @JsonProperty("uri_name") val uri_name: String? = null,
+        @JsonProperty("substreams") val substreams: List<PPVSubstream>? = null
     )
 
     data class PPVCategory(
@@ -149,14 +160,16 @@ class Cstrsp : MainAPI() {
                 
                 category.streams?.forEach { stream ->
                     val title = stream.name ?: "Unknown Event"
-                    val posterUrl = stream.poster
-                    val embedUrl = stream.iframe
+                    val posterUrl = stream.poster?.let {
+                        val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+                        "$mainUrl/api/images/proxy/$encoded.webp"
+                    }
                     
-                    if (embedUrl != null) {
+                    if (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty()) {
                         matchList.add(
                             newLiveSearchResponse(
-                                name = "$title [StreamSports]",
-                                url = "https://ppv.domains/${stream.id}||$embedUrl"
+                                name = "$title [PPV]",
+                                url = "https://ppv.domains/${stream.id}"
                             ) {
                                 this.posterUrl = posterUrl
                             }
@@ -164,7 +177,7 @@ class Cstrsp : MainAPI() {
                     }
                 }
                 if (matchList.isNotEmpty()) {
-                    homePageLists.add(HomePageList("$catName [StreamSports]", matchList))
+                    homePageLists.add(HomePageList("$catName [PPV]", matchList))
                 }
             }
         } catch (e: Exception) {
@@ -210,14 +223,16 @@ class Cstrsp : MainAPI() {
                     val title = stream.name ?: "Unknown Event"
                     
                     if (title.contains(query, ignoreCase = true)) {
-                        val posterUrl = stream.poster
-                        val embedUrl = stream.iframe
+                        val posterUrl = stream.poster?.let {
+                            val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+                            "$mainUrl/api/images/proxy/$encoded.webp"
+                        }
                         
-                        if (embedUrl != null) {
+                        if (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty()) {
                             results.add(
                                 newLiveSearchResponse(
-                                    name = "$title [StreamSports]",
-                                    url = "https://ppv.domains/${stream.id}||$embedUrl"
+                                    name = "$title [PPV]",
+                                    url = "https://ppv.domains/${stream.id}"
                                 ) {
                                     this.posterUrl = posterUrl
                                 }
@@ -245,13 +260,32 @@ class Cstrsp : MainAPI() {
         }
 
         // Handle PPV Streams
-        if (url.contains("ppv.domains/")) {
-            val embedUrl = url.substringAfter("||")
+        if (url.startsWith("https://ppv.domains/")) {
+            val streamId = url.substringAfterLast("/").toIntOrNull()
+            
+            val ppvRes = fetchPPVApi()
+            var foundStream: PPVStream? = null
+            ppvRes?.streams?.forEach { category ->
+                val s = category.streams?.find { it.id == streamId }
+                if (s != null) foundStream = s
+            }
+            
+            if (foundStream == null) return null
+            
+            val posterUrl = foundStream?.poster?.let {
+                val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+                "$mainUrl/api/images/proxy/$encoded.webp"
+            }
+            val title = foundStream?.name ?: "Live Stream"
+            
             return newLiveStreamLoadResponse(
-                name = "Live Stream",
+                name = title,
                 url = url,
-                dataUrl = "https://ppvextract.domains/||$embedUrl"
-            )
+                dataUrl = foundStream?.toJson()
+            ) {
+                this.posterUrl = posterUrl
+                this.plot = title
+            }
         }
 
         // Handle Streamed.pk (Main Source) URL format
@@ -315,24 +349,41 @@ class Cstrsp : MainAPI() {
         }
 
         // Handle PPV Extract
-        if (data.contains("ppvextract.domains/||")) {
-            val embedUrl = data.substringAfter("||")
-            loadExtractor(embedUrl, "https://embedindia.st/", subtitleCallback) { link ->
-                callback(
-                    ExtractorLink(
-                        source = "StreamSports",
-                        name = "StreamSports",
-                        url = link.url,
-                        referer = link.referer,
-                        quality = link.quality,
-                        type = link.type,
-                        headers = link.headers,
-                        extractorData = link.extractorData
-                    )
-                )
+        try {
+            val stream = AppUtils.parseJson<PPVStream>(data)
+            if (stream.id != null && (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())) {
+                val iframes = mutableListOf<Pair<String, String>>()
+                val mainIframe = stream.iframe ?: stream.uri_name?.let { "https://embedindia.st/embed/$it" }
+                if (mainIframe != null) {
+                    iframes.add(Pair("Main", mainIframe))
+                }
+                stream.substreams?.forEach { sub ->
+                    val subIframe = sub.iframe ?: sub.uri_name?.let { "https://embedindia.st/embed/$it" }
+                    if (subIframe != null) {
+                        val name = sub.source_tag ?: sub.name ?: sub.locale ?: "Substream"
+                        iframes.add(Pair(name, subIframe))
+                    }
+                }
+                
+                iframes.forEach { (name, iframeUrl) ->
+                    loadExtractor(iframeUrl, "https://embedindia.st/", subtitleCallback) { link ->
+                        callback(
+                            ExtractorLink(
+                                source = "PPV",
+                                name = "PPV - $name",
+                                url = link.url,
+                                referer = link.referer,
+                                quality = link.quality,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData
+                            )
+                        )
+                    }
+                }
+                return true
             }
-            return true
-        }
+        } catch (e: Exception) {}
 
         // Try parsing as Streamed.pk (Main Source) sources
         val sources = try {
