@@ -48,19 +48,30 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         }
 
                         @Suppress("NAME_SHADOWING") val url = request?.url.toString()
-                        val headers = request?.requestHeaders
+                        val headers = request?.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                        
+                        // Add WebView cookies to the headers so ExoPlayer can use them
+                        val cookie = android.webkit.CookieManager.getInstance().getCookie(url)
+                        if (cookie != null) {
+                            headers["Cookie"] = cookie
+                        }
+                        
+                        // Ensure User-Agent is present
+                        if (!headers.containsKey("User-Agent") && !headers.containsKey("user-agent")) {
+                            headers["User-Agent"] = view?.settings?.userAgentString ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                        }
 
                         Thread {
-                            fetchAndCheckResponse(url, headers) { sourceUrl, headers ->
+                            fetchAndCheckResponse(url, headers) { sourceUrl, outHeaders ->
                                 callback.invoke(
                                     ExtractorLink(
                                         source  = this@CstrspExtractor.name,
                                         name    = this@CstrspExtractor.name,
                                         url     = sourceUrl,
-                                        referer = headers["Referer"] ?: headers["referer"] ?: mainUrl,
+                                        referer = outHeaders["Referer"] ?: outHeaders["referer"] ?: mainUrl,
                                         quality = Qualities.Unknown.value,
                                         type    = ExtractorLinkType.M3U8,
-                                        headers = headers
+                                        headers = outHeaders
                                     )
                                 )
                             }
