@@ -149,7 +149,7 @@ class Cstrsp : MainAPI() {
 
     private suspend fun fetchWFMatches(): List<WFMatch>? {
         return try {
-            app.get("https://api.watchfooty.st/api/v1/matches/all").parsedSafe<List<WFMatch>>()
+            app.get("https://api.watchfooty.st/api/v1/matches/all").parsedSafe<Array<WFMatch>>()?.toList()
         } catch (e: Exception) {
             null
         }
