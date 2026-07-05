@@ -25,7 +25,7 @@ class Cstrsp : MainAPI() {
         if (isDomainChecked) return
         for (domain in domains) {
             try {
-                val response = app.get("$domain/api/matches/live", timeout = 5L)
+                val response = app.get("$domain/api/matches/live")
                 if (response.code in 200..299) {
                     mainUrl = domain
                     apiUrl = "$domain/api"
@@ -40,10 +40,10 @@ class Cstrsp : MainAPI() {
     }
 
     data class APIMatch(
-        @JsonProperty("id") val id: String,
-        @JsonProperty("title") val title: String,
-        @JsonProperty("category") val category: String,
-        @JsonProperty("date") val date: Long,
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("category") val category: String? = null,
+        @JsonProperty("date") val date: Long? = null,
         @JsonProperty("poster") val poster: String? = null,
         @JsonProperty("popular") val popular: Boolean = false,
         @JsonProperty("teams") val teams: APITeams? = null,
@@ -56,13 +56,13 @@ class Cstrsp : MainAPI() {
     )
 
     data class APITeam(
-        @JsonProperty("name") val name: String,
+        @JsonProperty("name") val name: String? = null,
         @JsonProperty("badge") val badge: String? = null
     )
 
     data class APISource(
-        @JsonProperty("source") val source: String,
-        @JsonProperty("id") val id: String
+        @JsonProperty("source") val source: String? = null,
+        @JsonProperty("id") val id: String? = null
     )
 
     data class APIStream(
@@ -108,7 +108,7 @@ class Cstrsp : MainAPI() {
         for (domain in ppvDomains) {
             try {
                 val url = "https://$domain/api/streams"
-                val response = app.get(url, timeout = 3L).text
+                val response = app.get(url).text
                 val parsed = AppUtils.parseJson<PPVResponse>(response)
                 if (parsed?.streams != null) {
                     return parsed
@@ -121,7 +121,7 @@ class Cstrsp : MainAPI() {
     // Helper to fetch matches from streamed.pk
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> {
         return try {
-            app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList() ?: emptyList()
+            app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList()?.filter { it.id != null && it.title != null } ?: emptyList()
         } catch (e: Exception) {
             emptyList()
         }
@@ -135,6 +135,8 @@ class Cstrsp : MainAPI() {
         val mainMatches = fetchMatches("$apiUrl/matches/live")
         mainMatches.groupBy { it.category }.forEach { (category, matches) ->
             val list = matches.mapNotNull { match ->
+                val id = match.id ?: return@mapNotNull null
+                val title = match.title ?: return@mapNotNull null
                 val posterUrl = if (match.poster != null) {
                     "$mainUrl${match.poster}"
                 } else if (match.teams?.home?.badge != null) {
@@ -142,12 +144,13 @@ class Cstrsp : MainAPI() {
                 } else {
                     null
                 }
-                newLiveSearchResponse(match.title, "$mainUrl/match/${match.id}") {
+                newLiveSearchResponse(title, "$mainUrl/match/$id") {
                     this.posterUrl = posterUrl
                 }
             }
             if (list.isNotEmpty()) {
-                homePageLists.add(HomePageList("${category.replaceFirstChar { it.uppercase() }} [Streamed]", list))
+                val catName = category ?: "Other"
+                homePageLists.add(HomePageList("${catName.replaceFirstChar { it.uppercase() }} [Streamed]", list))
             }
         }
 
@@ -207,10 +210,13 @@ class Cstrsp : MainAPI() {
         
         val queryParts = query.split(" ").filter { it.isNotBlank() }
         results.addAll(allMatches.filter { match -> 
-            queryParts.all { match.title.contains(it, ignoreCase = true) }
+            val title = match.title ?: return@filter false
+            queryParts.all { title.contains(it, ignoreCase = true) }
         }.mapNotNull { match ->
+            val id = match.id ?: return@mapNotNull null
+            val title = match.title ?: return@mapNotNull null
             val posterUrl = if (match.poster != null) "$mainUrl${match.poster}" else if (match.teams?.home?.badge != null) "$apiUrl/images/badge/${match.teams.home.badge}.webp" else null
-            newLiveSearchResponse(match.title, "$mainUrl/match/${match.id}") {
+            newLiveSearchResponse(title, "$mainUrl/match/$id") {
                 this.posterUrl = posterUrl
             }
         })
