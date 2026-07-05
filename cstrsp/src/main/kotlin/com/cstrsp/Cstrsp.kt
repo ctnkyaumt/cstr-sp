@@ -316,8 +316,8 @@ class Cstrsp : MainAPI() {
             null
         }
 
-        val sourceNames = match.sources?.joinToString(", ") { src ->
-            src.source.replaceFirstChar { it.uppercase() }
+        val sourceNames = match.sources?.mapNotNull { it.source }?.joinToString(", ") { src ->
+            src.replaceFirstChar { it.uppercase() }
         } ?: ""
         val sourceLabel = if (sourceNames.isNotEmpty()) " [$sourceNames]" else ""
         val liveLabel = if (!isLive) " [Upcoming]" else ""
@@ -409,7 +409,7 @@ class Cstrsp : MainAPI() {
                             val isHD = stream.hd
                             val langStr = stream.language ?: "Unknown"
                             val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
-                            val sourceName = source.source.replaceFirstChar { it.uppercase() }
+                            val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
                             val name = "$sourceName - $langStr"
                             val embedUrl = stream.embedUrl
     
