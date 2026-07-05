@@ -102,20 +102,57 @@ class Cstrsp : MainAPI() {
         @JsonProperty("streams") val streams: List<PPVCategory>? = null
     )
 
+    data class WFStream(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("source") val source: String? = null,
+        @JsonProperty("quality") val quality: String? = null,
+        @JsonProperty("language") val language: String? = null,
+        @JsonProperty("isRedirect") val isRedirect: Boolean? = false,
+        @JsonProperty("nsfw") val nsfw: Boolean? = false
+    )
+
+    data class WFTeam(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("logoUrl") val logoUrl: String? = null,
+        @JsonProperty("logoId") val logoId: String? = null
+    )
+
+    data class WFTeams(
+        @JsonProperty("home") val home: WFTeam? = null,
+        @JsonProperty("away") val away: WFTeam? = null
+    )
+
+    data class WFMatch(
+        @JsonProperty("matchId") val matchId: String? = null,
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("poster") val poster: String? = null,
+        @JsonProperty("teams") val teams: WFTeams? = null,
+        @JsonProperty("status") val status: String? = null,
+        @JsonProperty("league") val league: String? = null,
+        @JsonProperty("sport") val sport: String? = null,
+        @JsonProperty("streams") val streams: List<WFStream>? = null
+    )
+
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
 
     private suspend fun fetchPPVApi(): PPVResponse? {
         for (domain in ppvDomains) {
             try {
                 val url = "https://$domain/api/streams"
-                val response = app.get(url).text
-                val parsed = AppUtils.parseJson<PPVResponse>(response)
-                if (parsed?.streams != null) {
-                    return parsed
-                }
+                val res = app.get(url).parsedSafe<PPVResponse>()
+                if (res?.streams != null) return res
             } catch (e: Exception) {}
         }
         return null
+    }
+
+    private suspend fun fetchWFMatches(): List<WFMatch>? {
+        return try {
+            app.get("https://api.watchfooty.st/api/v1/matches/all").parsedSafe<List<WFMatch>>()
+        } catch (e: Exception) {
+            null
+        }
     }
 
     // Helper to fetch matches from streamed.pk
@@ -184,7 +221,34 @@ class Cstrsp : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            // Backup source failed
+            e.printStackTrace()
+        }
+
+        // Handle WF Streams
+        try {
+            val wfMatches = fetchWFMatches()
+            wfMatches?.groupBy { it.sport ?: "Unknown" }?.forEach { (sport, matches) ->
+                val matchList = mutableListOf<SearchResponse>()
+                matches.forEach { match ->
+                    if (match.matchId != null && !match.streams.isNullOrEmpty()) {
+                        val title = match.title ?: "Live Event"
+                        val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
+                        matchList.add(
+                            newLiveSearchResponse(
+                                name = "$title [WF]",
+                                url = "https://wf.domains/${match.matchId}"
+                            ) {
+                                this.posterUrl = posterUrl
+                            }
+                        )
+                    }
+                }
+                if (matchList.isNotEmpty()) {
+                    homePageLists.add(HomePageList("${sport.replaceFirstChar { it.uppercase() }} [WF]", matchList))
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
 
         return newHomePageResponse(homePageLists)
@@ -249,6 +313,27 @@ class Cstrsp : MainAPI() {
             }
         } catch (e: Exception) {}
 
+        // Handle WF Streams search
+        try {
+            val wfMatches = fetchWFMatches()
+            wfMatches?.forEach { match ->
+                val title = match.title ?: "Live Event"
+                if (title.contains(query, ignoreCase = true) && match.matchId != null && !match.streams.isNullOrEmpty()) {
+                    val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
+                    results.add(
+                        newLiveSearchResponse(
+                            name = "$title [WF]",
+                            url = "https://wf.domains/${match.matchId}"
+                        ) {
+                            this.posterUrl = posterUrl
+                        }
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
         return results
     }
 
@@ -288,6 +373,25 @@ class Cstrsp : MainAPI() {
                 name = title,
                 url = url,
                 dataUrl = foundStream!!.toJson()
+            ) {
+                this.posterUrl = posterUrl
+                this.plot = title
+            }
+        }
+
+        // Handle WF Streams
+        if (url.startsWith("https://wf.domains/")) {
+            val matchId = url.substringAfterLast("/")
+            val wfMatches = fetchWFMatches()
+            val match = wfMatches?.find { it.matchId == matchId } ?: return null
+            
+            val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
+            val title = match.title ?: "Live Stream"
+            
+            return newLiveStreamLoadResponse(
+                name = title,
+                url = url,
+                dataUrl = match.toJson()
             ) {
                 this.posterUrl = posterUrl
                 this.plot = title
@@ -385,6 +489,33 @@ class Cstrsp : MainAPI() {
                                 extractorData = link.extractorData
                             )
                         )
+                    }
+                }
+                return true
+            }
+        } catch (e: Exception) {}
+
+        // Handle WF Extract
+        try {
+            val match = AppUtils.parseJson<WFMatch>(data)
+            if (match.matchId != null && !match.streams.isNullOrEmpty()) {
+                match.streams.forEach { stream ->
+                    if (stream.url != null) {
+                        val name = listOfNotNull(stream.source, stream.quality, stream.language).joinToString(" - ")
+                        loadExtractor(stream.url, "https://api.watchfooty.st/", subtitleCallback) { link ->
+                            callback(
+                                ExtractorLink(
+                                    source = "WF",
+                                    name = "WF - $name",
+                                    url = link.url,
+                                    referer = link.referer,
+                                    quality = link.quality,
+                                    type = link.type,
+                                    headers = link.headers,
+                                    extractorData = link.extractorData
+                                )
+                            )
+                        }
                     }
                 }
                 return true
