@@ -174,6 +174,26 @@ class Cstrsp : MainAPI() {
         @JsonProperty("streams") val streams: List<SFStream>? = null
     )
 
+    // streamfree.top builds its m3u8 in JS from three pieces: a token map embedded in
+    // the embed page (_0x), the current server from /get-stream-key, and the available
+    // quality from /api/stream-status. A headless WebView can't complete the player
+    // init chain, so we replicate that construction directly.
+    data class SFStreamKey(
+        @JsonProperty("is_external") val isExternal: Boolean? = false,
+        @JsonProperty("external_url") val externalUrl: String? = null,
+        @JsonProperty("server_name") val serverName: String? = null
+    )
+
+    data class SFStatus(
+        @JsonProperty("qualities") val qualities: Map<String, Boolean>? = null
+    )
+
+    data class SFToken(
+        @JsonProperty("_t") val t: String? = null,
+        @JsonProperty("_e") val e: Long? = null,
+        @JsonProperty("_n") val n: String? = null
+    )
+
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
 
     private suspend fun fetchPPVApi(): PPVResponse? {
@@ -220,6 +240,55 @@ class Cstrsp : MainAPI() {
                 ?.filter { it.name != null && it.embedUrl != null && it.streamKey != null } ?: emptyList()
         } catch (e: Exception) {
             emptyList()
+        }
+    }
+
+    private fun sfQuality(q: String): Int = when (q) {
+        "2160p" -> Qualities.P2160.value
+        "1080p" -> Qualities.P1080.value
+        "720p" -> Qualities.P720.value
+        "540p" -> Qualities.P480.value
+        else -> Qualities.Unknown.value
+    }
+
+    // Resolves a StreamFree embed to a playable link. Returns (url, isM3u8): a direct
+    // m3u8 (isM3u8 = true) for hosted streams, or an external embed url to hand off to
+    // loadExtractor (isM3u8 = false). Null if the stream isn't currently live.
+    private suspend fun resolveStreamFree(key: String, embedUrl: String): Triple<String, Boolean, String>? {
+        val ref = "$streamfreeUrl/"
+        val sk = try {
+            app.get("$streamfreeUrl/get-stream-key/$key", referer = ref).parsedSafe<SFStreamKey>()
+        } catch (e: Exception) {
+            null
+        } ?: return null
+
+        if (sk.isExternal == true && sk.externalUrl != null) return Triple(sk.externalUrl, false, "720p")
+
+        val qualities = try {
+            app.get("$streamfreeUrl/api/stream-status/$key", referer = ref).parsedSafe<SFStatus>()?.qualities
+        } catch (e: Exception) {
+            null
+        }.orEmpty()
+        // Match the page's getBestQuality() preference order.
+        val quality = listOf("720p", "1080p", "2160p", "540p").firstOrNull { qualities[it] == true } ?: "720p"
+
+        val tokens = try {
+            val html = app.get(embedUrl, referer = ref).text
+            val json = Regex("const _0x = (\\{.*?\\});").find(html)?.groupValues?.get(1) ?: return null
+            AppUtils.parseJson<Map<String, SFToken>>(json)
+        } catch (e: Exception) {
+            return null
+        }
+        val token = tokens[quality] ?: return null
+        if (token.t == null || token.e == null || token.n == null) return null
+
+        val prefix = if ((sk.serverName ?: "origin") != "origin") "live-cdn" else "live"
+        val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
+        // Only emit if the playlist is actually live (upcoming events 404 here).
+        return try {
+            if (app.get(url, referer = ref).text.contains("#EXTM3U")) Triple(url, true, quality) else null
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -711,20 +780,41 @@ class Cstrsp : MainAPI() {
         // Handle StreamFree Extract
         try {
             val stream = AppUtils.parseJson<SFStream>(data)
-            if (stream.embedUrl != null && stream.streamKey != null) {
-                loadExtractor(stream.embedUrl, "$streamfreeUrl/", subtitleCallback) { link ->
-                    callback(
-                        ExtractorLink(
-                            source = "StreamFree",
-                            name = "StreamFree - ${stream.name ?: "Live"}",
-                            url = link.url,
-                            referer = link.referer,
-                            quality = link.quality,
-                            type = link.type,
-                            headers = link.headers,
-                            extractorData = link.extractorData
+            val key = stream.streamKey
+            if (stream.embedUrl != null && key != null) {
+                val resolved = resolveStreamFree(key, stream.embedUrl)
+                if (resolved != null) {
+                    val (streamUrl, isM3u8, quality) = resolved
+                    val label = "StreamFree - ${stream.name ?: "Live"}"
+                    if (isM3u8) {
+                        callback(
+                            ExtractorLink(
+                                source = "StreamFree",
+                                name = label,
+                                url = streamUrl,
+                                referer = "$streamfreeUrl/",
+                                quality = sfQuality(quality),
+                                type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8,
+                                headers = mapOf("Referer" to "$streamfreeUrl/")
+                            )
                         )
-                    )
+                    } else {
+                        // External embed on another host: hand off to the extractors.
+                        loadExtractor(streamUrl, "$streamfreeUrl/", subtitleCallback) { link ->
+                            callback(
+                                ExtractorLink(
+                                    source = "StreamFree",
+                                    name = label,
+                                    url = link.url,
+                                    referer = link.referer,
+                                    quality = link.quality,
+                                    type = link.type,
+                                    headers = link.headers,
+                                    extractorData = link.extractorData
+                                )
+                            )
+                        }
+                    }
                 }
                 return true
             }
