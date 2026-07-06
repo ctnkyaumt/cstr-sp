@@ -18,6 +18,7 @@ class Cstrsp : MainAPI() {
 
     private var apiUrl = "https://streamed.pk/api"
     private val cdnApiUrl = "https://api.cdnlivetv.tv/api/v1"
+    private val streamfreeUrl = "https://streamfree.top"
     private var isDomainChecked = false
     private val domains = listOf("https://streamed.pk", "https://streamed.st")
 
@@ -134,6 +135,45 @@ class Cstrsp : MainAPI() {
         @JsonProperty("streams") val streams: List<WFStream>? = null
     )
 
+    // cdnlivetv.tv (StreamSports)
+    data class CdnChannel(
+        @JsonProperty("channel_name") val channelName: String? = null,
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("image") val image: String? = null
+    )
+
+    data class CdnEvent(
+        @JsonProperty("gameID") val gameID: String? = null,
+        @JsonProperty("event") val event: String? = null,
+        @JsonProperty("homeTeam") val homeTeam: String? = null,
+        @JsonProperty("awayTeam") val awayTeam: String? = null,
+        @JsonProperty("homeTeamIMG") val homeTeamImg: String? = null,
+        @JsonProperty("eventIMG") val eventImg: String? = null,
+        @JsonProperty("status") val status: String? = null,
+        @JsonProperty("channels") val channels: List<CdnChannel>? = null
+    )
+
+    // The "cdn-live-tv" object mixes sport arrays (e.g. "Soccer": [...]) with scalar
+    // metadata ("total_events_soccer": 793, "cached": true, "timestamp": ...), so it
+    // can't be typed as Map<String, List<CdnEvent>>. Parse loosely and keep list values.
+    data class CdnResponse(
+        @JsonProperty("cdn-live-tv") val data: Map<String, Any?>? = null
+    )
+
+    // streamfree.top (StreamFree)
+    data class SFStream(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("category") val category: String? = null,
+        @JsonProperty("league") val league: String? = null,
+        @JsonProperty("stream_key") val streamKey: String? = null,
+        @JsonProperty("embed_url") val embedUrl: String? = null,
+        @JsonProperty("thumbnail_url") val thumbnailUrl: String? = null
+    )
+
+    data class SFResponse(
+        @JsonProperty("streams") val streams: List<SFStream>? = null
+    )
+
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
 
     private suspend fun fetchPPVApi(): PPVResponse? {
@@ -155,6 +195,45 @@ class Cstrsp : MainAPI() {
         }
     }
 
+    // Returns sport -> events, keeping only events that currently have a playable channel.
+    private suspend fun fetchCdnEvents(): Map<String, List<CdnEvent>> {
+        val res = try {
+            app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").parsedSafe<CdnResponse>()
+        } catch (e: Exception) {
+            null
+        } ?: return emptyMap()
+
+        val out = LinkedHashMap<String, List<CdnEvent>>()
+        res.data?.forEach { (sport, value) ->
+            val raw = value as? List<*> ?: return@forEach // skip scalar metadata keys
+            val events = raw.mapNotNull { el ->
+                try { AppUtils.parseJson<CdnEvent>((el ?: return@mapNotNull null).toJson()) } catch (e: Exception) { null }
+            }.filter { ev -> ev.gameID != null && ev.channels?.any { !it.url.isNullOrBlank() } == true }
+            if (events.isNotEmpty()) out[sport] = events
+        }
+        return out
+    }
+
+    private suspend fun fetchSFStreams(): List<SFStream> {
+        return try {
+            app.get("$streamfreeUrl/api/v1/streams").parsedSafe<SFResponse>()?.streams
+                ?.filter { it.name != null && it.embedUrl != null && it.streamKey != null } ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun streamedPoster(match: APIMatch): String? = when {
+        match.poster != null -> "$mainUrl${match.poster}"
+        match.teams?.home?.badge != null -> "$apiUrl/images/badge/${match.teams.home.badge}.webp"
+        else -> null
+    }
+
+    private fun cdnTitle(event: CdnEvent): String =
+        event.event ?: listOfNotNull(event.homeTeam, event.awayTeam).joinToString(" vs ").ifBlank { "Live Event" }
+
+    private fun cdnPoster(event: CdnEvent): String? = event.homeTeamImg ?: event.eventImg
+
     // Helper to fetch matches from streamed.pk
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> {
         return try {
@@ -174,15 +253,8 @@ class Cstrsp : MainAPI() {
             val list = matches.mapNotNull { match ->
                 val id = match.id ?: return@mapNotNull null
                 val title = match.title ?: return@mapNotNull null
-                val posterUrl = if (match.poster != null) {
-                    "$mainUrl${match.poster}"
-                } else if (match.teams?.home?.badge != null) {
-                    "$apiUrl/images/badge/${match.teams.home.badge}.webp"
-                } else {
-                    null
-                }
                 newLiveSearchResponse(title, "$mainUrl/match/$id") {
-                    this.posterUrl = posterUrl
+                    this.posterUrl = streamedPoster(match)
                 }
             }
             if (list.isNotEmpty()) {
@@ -251,6 +323,40 @@ class Cstrsp : MainAPI() {
             e.printStackTrace()
         }
 
+        // StreamSports (cdnlivetv.tv) Backup Source
+        try {
+            fetchCdnEvents().forEach { (sport, events) ->
+                val matchList = events.mapNotNull { event ->
+                    val gameId = event.gameID ?: return@mapNotNull null
+                    newLiveSearchResponse("${cdnTitle(event)} [StreamSports]", "https://cdn.domains/$gameId") {
+                        this.posterUrl = cdnPoster(event)
+                    }
+                }
+                if (matchList.isNotEmpty()) {
+                    homePageLists.add(HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", matchList))
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        // StreamFree (streamfree.top) Backup Source
+        try {
+            fetchSFStreams().groupBy { it.category ?: "Other" }.forEach { (category, streams) ->
+                val matchList = streams.mapNotNull { stream ->
+                    val key = stream.streamKey ?: return@mapNotNull null
+                    newLiveSearchResponse("${stream.name} [StreamFree]", "https://sf.domains/$key") {
+                        this.posterUrl = stream.thumbnailUrl
+                    }
+                }
+                if (matchList.isNotEmpty()) {
+                    homePageLists.add(HomePageList("${category.replaceFirstChar { it.uppercase() }} [StreamFree]", matchList))
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
         return newHomePageResponse(homePageLists)
     }
 
@@ -279,9 +385,8 @@ class Cstrsp : MainAPI() {
         }.mapNotNull { match ->
             val id = match.id ?: return@mapNotNull null
             val title = match.title ?: return@mapNotNull null
-            val posterUrl = if (match.poster != null) "$mainUrl${match.poster}" else if (match.teams?.home?.badge != null) "$apiUrl/images/badge/${match.teams.home.badge}.webp" else null
             newLiveSearchResponse(title, "$mainUrl/match/$id") {
-                this.posterUrl = posterUrl
+                this.posterUrl = streamedPoster(match)
             }
         })
 
@@ -334,6 +439,36 @@ class Cstrsp : MainAPI() {
             e.printStackTrace()
         }
 
+        // Search StreamSports (cdnlivetv)
+        try {
+            fetchCdnEvents().values.flatten().forEach { event ->
+                val gameId = event.gameID ?: return@forEach
+                val title = cdnTitle(event)
+                if (title.contains(query, ignoreCase = true)) {
+                    results.add(
+                        newLiveSearchResponse("$title [StreamSports]", "https://cdn.domains/$gameId") {
+                            this.posterUrl = cdnPoster(event)
+                        }
+                    )
+                }
+            }
+        } catch (e: Exception) {}
+
+        // Search StreamFree
+        try {
+            fetchSFStreams().forEach { stream ->
+                val key = stream.streamKey ?: return@forEach
+                val title = stream.name ?: return@forEach
+                if (title.contains(query, ignoreCase = true)) {
+                    results.add(
+                        newLiveSearchResponse("$title [StreamFree]", "https://sf.domains/$key") {
+                            this.posterUrl = stream.thumbnailUrl
+                        }
+                    )
+                }
+            }
+        } catch (e: Exception) {}
+
         return results
     }
 
@@ -368,9 +503,9 @@ class Cstrsp : MainAPI() {
                 "$mainUrl/api/images/proxy/$encoded.webp"
             }
             val title = foundStream?.name ?: "Live Stream"
-            
+
             return newLiveStreamLoadResponse(
-                name = title,
+                name = "$title [PPV]",
                 url = url,
                 dataUrl = foundStream!!.toJson()
             ) {
@@ -387,13 +522,43 @@ class Cstrsp : MainAPI() {
             
             val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
             val title = match.title ?: "Live Stream"
-            
+
             return newLiveStreamLoadResponse(
-                name = title,
+                name = "$title [WF]",
                 url = url,
                 dataUrl = match.toJson()
             ) {
                 this.posterUrl = posterUrl
+                this.plot = title
+            }
+        }
+
+        // Handle StreamSports (cdnlivetv) Streams
+        if (url.startsWith("https://cdn.domains/")) {
+            val gameId = url.substringAfterLast("/")
+            val event = fetchCdnEvents().values.flatten().find { it.gameID == gameId } ?: return null
+            val title = cdnTitle(event)
+            return newLiveStreamLoadResponse(
+                name = "$title [StreamSports]",
+                url = url,
+                dataUrl = event.toJson()
+            ) {
+                this.posterUrl = cdnPoster(event)
+                this.plot = title
+            }
+        }
+
+        // Handle StreamFree Streams
+        if (url.startsWith("https://sf.domains/")) {
+            val key = url.substringAfterLast("/")
+            val stream = fetchSFStreams().find { it.streamKey == key } ?: return null
+            val title = stream.name ?: "Live Stream"
+            return newLiveStreamLoadResponse(
+                name = "$title [StreamFree]",
+                url = url,
+                dataUrl = stream.toJson()
+            ) {
+                this.posterUrl = stream.thumbnailUrl
                 this.plot = title
             }
         }
@@ -412,13 +577,7 @@ class Cstrsp : MainAPI() {
 
         if (match == null) return null
 
-        val posterUrl = if (match.poster != null) {
-            "$mainUrl${match.poster}"
-        } else if (match.teams?.home?.badge != null) {
-            "$apiUrl/images/badge/${match.teams.home.badge}.webp"
-        } else {
-            null
-        }
+        val posterUrl = streamedPoster(match)
 
         val sourceNames = match.sources?.mapNotNull { it.source }?.joinToString(", ") { src ->
             src.replaceFirstChar { it.uppercase() }
@@ -517,6 +676,55 @@ class Cstrsp : MainAPI() {
                             )
                         }
                     }
+                }
+                return true
+            }
+        } catch (e: Exception) {}
+
+        // Handle StreamSports (cdnlivetv) Extract
+        try {
+            val event = AppUtils.parseJson<CdnEvent>(data)
+            if (event.gameID != null && !event.channels.isNullOrEmpty()) {
+                // Cap channels: an event can carry 100+, and each spawns a WebView extractor.
+                val channels = event.channels.filter { !it.url.isNullOrBlank() }.take(8)
+                channels.forEach { channel ->
+                    val chName = channel.channelName ?: "Channel"
+                    loadExtractor(channel.url!!, "https://cdnlivetv.tv/", subtitleCallback) { link ->
+                        callback(
+                            ExtractorLink(
+                                source = "StreamSports",
+                                name = "StreamSports - $chName",
+                                url = link.url,
+                                referer = link.referer,
+                                quality = link.quality,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData
+                            )
+                        )
+                    }
+                }
+                return true
+            }
+        } catch (e: Exception) {}
+
+        // Handle StreamFree Extract
+        try {
+            val stream = AppUtils.parseJson<SFStream>(data)
+            if (stream.embedUrl != null && stream.streamKey != null) {
+                loadExtractor(stream.embedUrl, "$streamfreeUrl/", subtitleCallback) { link ->
+                    callback(
+                        ExtractorLink(
+                            source = "StreamFree",
+                            name = "StreamFree - ${stream.name ?: "Live"}",
+                            url = link.url,
+                            referer = link.referer,
+                            quality = link.quality,
+                            type = link.type,
+                            headers = link.headers,
+                            extractorData = link.extractorData
+                        )
+                    )
                 }
                 return true
             }
