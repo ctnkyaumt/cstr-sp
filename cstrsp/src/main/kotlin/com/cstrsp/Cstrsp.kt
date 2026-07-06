@@ -727,23 +727,28 @@ class Cstrsp : MainAPI() {
         try {
             val match = AppUtils.parseJson<WFMatch>(data)
             if (match.matchId != null && !match.streams.isNullOrEmpty()) {
-                match.streams.forEach { stream ->
-                    if (stream.url != null) {
-                        val name = listOfNotNull(stream.source, stream.quality, stream.language).joinToString(" - ")
-                        loadExtractor(stream.url, "https://api.watchfooty.st/", subtitleCallback) { link ->
-                            callback(
-                                ExtractorLink(
-                                    source = "WF",
-                                    name = "WF - $name",
-                                    url = link.url,
-                                    referer = link.referer,
-                                    quality = link.quality,
-                                    type = link.type,
-                                    headers = link.headers,
-                                    extractorData = link.extractorData
-                                )
+                // HD only. Also cap the count: a match can list 90+ feeds and each spawns
+                // a WebView extractor. Prefer the match-specific sources over the "prime"
+                // channel dump, whose per-channel feeds sometimes carry an unrelated event.
+                val streams = match.streams
+                    .filter { it.url != null && !"SD".equals(it.quality, ignoreCase = true) }
+                    .sortedBy { it.source == "prime" }
+                    .take(15)
+                streams.forEach { stream ->
+                    val name = listOfNotNull(stream.source, stream.quality, stream.language).joinToString(" - ")
+                    loadExtractor(stream.url!!, "https://api.watchfooty.st/", subtitleCallback) { link ->
+                        callback(
+                            ExtractorLink(
+                                source = "WF",
+                                name = "WF - $name",
+                                url = link.url,
+                                referer = link.referer,
+                                quality = link.quality,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData
                             )
-                        }
+                        )
                     }
                 }
                 return true
@@ -830,14 +835,14 @@ class Cstrsp : MainAPI() {
         if (sources != null) {
             for (source in sources) {
                 try {
+                    // HD only (drop SD streams).
                     val streams = app.get("$apiUrl/stream/${source.source}/${source.id}")
-                        .parsedSafe<Array<APIStream>>()?.toList() ?: emptyList()
-    
+                        .parsedSafe<Array<APIStream>>()?.toList()?.filter { it.hd } ?: emptyList()
+
                     for (stream in streams) {
                         try {
-                            val isHD = stream.hd
                             val langStr = stream.language ?: "Unknown"
-                            val quality = if (isHD) Qualities.P1080.value else Qualities.P720.value
+                            val quality = Qualities.P1080.value
                             val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
                             val name = "$sourceName - $langStr"
                             val embedUrl = stream.embedUrl
