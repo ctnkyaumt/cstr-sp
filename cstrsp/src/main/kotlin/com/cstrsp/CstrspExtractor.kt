@@ -25,6 +25,9 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
     @SuppressLint("SetJavaScriptEnabled")
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         var isDone = false
+        // Captured on the main thread; shouldInterceptRequest runs on a background thread
+        // where calling any WebView method (e.g. settings.userAgentString) would crash.
+        var cachedUserAgent: String? = null
         withContext(Dispatchers.Main) {
             webView = WebView(context).apply {
                 settings.apply {
@@ -40,6 +43,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     mediaPlaybackRequiresUserGesture   = false
                     mixedContentMode                   = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 }
+                cachedUserAgent = settings.userAgentString
 
                 webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
@@ -59,9 +63,10 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                             headers["Cookie"] = cookie
                         }
                         
-                        // Ensure User-Agent is present
+                        // Ensure User-Agent is present. Use the value cached on the main
+                        // thread — never touch view.settings here (background thread).
                         if (!headers.containsKey("User-Agent") && !headers.containsKey("user-agent")) {
-                            headers["User-Agent"] = view?.settings?.userAgentString ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                            headers["User-Agent"] = cachedUserAgent ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                         }
 
                         Thread {
