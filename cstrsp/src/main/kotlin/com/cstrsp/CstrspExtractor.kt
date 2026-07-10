@@ -16,6 +16,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicBoolean
 
 open class CstrspExtractor(override val mainUrl: String, private val context: Context) : ExtractorApi() {
     override val name            = "Cstrsp Extractor (${mainUrl.substringAfter("://").substringBefore("/")})"
@@ -24,7 +25,11 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
     @SuppressLint("SetJavaScriptEnabled")
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        var isDone = false
+        // AtomicBoolean: shouldInterceptRequest fires on a fresh background thread per
+        // request, so a plain var here is a TOCTOU race — two in-flight requests (e.g. a
+        // master playlist and a variant playlist landing back-to-back) can both pass the
+        // "not done yet" check and both invoke callback before either write is visible.
+        val isDone = AtomicBoolean(false)
         // Captured on the main thread; shouldInterceptRequest runs on a background thread
         // where calling any WebView method (e.g. settings.userAgentString) would crash.
         var cachedUserAgent: String? = null
@@ -46,8 +51,20 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                 cachedUserAgent = settings.userAgentString
 
                 webViewClient = object : WebViewClient() {
+                    // These embed pages are ad-heavy and some fire a forced top-frame
+                    // navigation (e.g. to a data: URI) within a second of load, which tears
+                    // down the page's own player script before it ever requests the real
+                    // stream. Block anything that isn't a normal http(s) navigation so the
+                    // player keeps running; this never affects the initial loadUrl() below,
+                    // since shouldOverrideUrlLoading only fires for navigations the WebView
+                    // itself initiates afterwards.
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                        val scheme = request?.url?.scheme?.lowercase()
+                        return scheme != null && scheme != "http" && scheme != "https"
+                    }
+
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                        if (isDone) return super.shouldInterceptRequest(view, request)
+                        if (isDone.get()) return super.shouldInterceptRequest(view, request)
                         
                         val method = request?.method ?: "GET"
                         if (method.uppercase() != "GET") {
@@ -71,8 +88,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
                         Thread {
                             fetchAndCheckResponse(reqUrl, headers) { sourceUrl, outHeaders ->
-                                if (!isDone) {
-                                    isDone = true
+                                if (isDone.compareAndSet(false, true)) {
                                     callback.invoke(
                                         ExtractorLink(
                                             source  = this@CstrspExtractor.name,
@@ -102,7 +118,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
         try {
             var waitTime = 0
-            while (!isDone && waitTime < 15000) {
+            while (!isDone.get() && waitTime < 15000) {
                 delay(200)
                 waitTime += 200
             }

@@ -7,6 +7,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.fasterxml.jackson.annotation.JsonProperty
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 class Cstrsp : MainAPI() {
     override var mainUrl = "https://streamed.pk"
@@ -312,6 +317,119 @@ class Cstrsp : MainAPI() {
         }
     }
 
+    // Resolves candidates (WebView-based loadExtractor calls) with bounded concurrency
+    // instead of one at a time. Each call can take up to ~15s to time out, so resolving a
+    // 15-stream list sequentially can take minutes — by then, early links from
+    // short-lived/signed CDN URLs are often already stale by the time the user picks one.
+    // Each item runs independently so one failure/timeout doesn't block the others.
+    private suspend fun <T> List<T>.resolveConcurrently(action: suspend (T) -> Unit) = coroutineScope {
+        val semaphore = Semaphore(4)
+        map { item ->
+            async {
+                semaphore.withPermit {
+                    try {
+                        action(item)
+                    } catch (e: Exception) {
+                        // Skip this candidate; others continue independently.
+                    }
+                }
+            }
+        }.awaitAll()
+        Unit
+    }
+
+    // --- Turkish search support ---------------------------------------------------
+    // Upstream APIs only return English titles ("Spain vs Portugal"), but Turkish users
+    // search using Turkish names ("İspanya"). We fold Turkish letters/case, translate
+    // common Turkish nation names to English, and also try devoiced spelling variants
+    // (Turkish devoices word-final b/c/d/g to p/ç/t/k, e.g. kitap/kitabı, Bağdat) so
+    // slightly different spellings still match.
+
+    private val trCountryNames = mapOf(
+        "ispanya" to "spain", "portekiz" to "portugal", "almanya" to "germany",
+        "fransa" to "france", "ingiltere" to "england", "italya" to "italy",
+        "hollanda" to "netherlands", "belcika" to "belgium", "hirvatistan" to "croatia",
+        "sirbistan" to "serbia", "polonya" to "poland", "avusturya" to "austria",
+        "isvicre" to "switzerland", "isvec" to "sweden", "norvec" to "norway",
+        "danimarka" to "denmark", "finlandiya" to "finland", "yunanistan" to "greece",
+        "rusya" to "russia", "ukrayna" to "ukraine", "romanya" to "romania",
+        "bulgaristan" to "bulgaria", "macaristan" to "hungary", "cekya" to "czech republic",
+        "slovakya" to "slovakia", "slovenya" to "slovenia", "karadag" to "montenegro",
+        "arnavutluk" to "albania", "iskocya" to "scotland", "galler" to "wales",
+        "irlanda" to "ireland", "izlanda" to "iceland", "turkiye" to "turkey",
+        "amerika" to "usa", "brezilya" to "brazil", "arjantin" to "argentina",
+        "meksika" to "mexico", "kolombiya" to "colombia", "sili" to "chile",
+        "peru" to "peru", "uruguay" to "uruguay", "ekvador" to "ecuador",
+        "fas" to "morocco", "misir" to "egypt", "cezayir" to "algeria",
+        "tunus" to "tunisia", "nijerya" to "nigeria", "senegal" to "senegal",
+        "gana" to "ghana", "kamerun" to "cameroon", "japonya" to "japan",
+        "katar" to "qatar", "iran" to "iran", "irak" to "iraq",
+        "avustralya" to "australia", "cin" to "china", "hindistan" to "india",
+        "cad" to "chad", "urdun" to "jordan", "kanada" to "canada",
+        "endonezya" to "indonesia", "tayland" to "thailand", "lubnan" to "lebanon",
+        "umman" to "oman", "suriye" to "syria"
+    )
+
+    private val trPhraseNames = mapOf(
+        "suudi arabistan" to "saudi arabia", "guney kore" to "south korea",
+        "kuzey kore" to "north korea", "guney afrika" to "south africa",
+        "yeni zelanda" to "new zealand", "kuzey makedonya" to "north macedonia",
+        "bosna hersek" to "bosnia", "kuzey irlanda" to "northern ireland",
+        "fildisi sahili" to "ivory coast", "birlesik arap emirlikleri" to "united arab emirates"
+    )
+
+    private val devoicingPairs = listOf('t' to 'd', 'p' to 'b', 'k' to 'g')
+
+    // ASCII-folds Turkish letters/case (İ/I/ı, ş, ğ, ü, ö, ç) so comparisons never trip
+    // over dotted/dotless I or diacritics.
+    private fun trFold(s: String): String {
+        val sb = StringBuilder(s.length)
+        for (c in s) {
+            sb.append(
+                when (c) {
+                    'İ', 'I', 'ı' -> 'i'
+                    'Ş', 'ş' -> 's'
+                    'Ğ', 'ğ' -> 'g'
+                    'Ü', 'ü' -> 'u'
+                    'Ö', 'ö' -> 'o'
+                    'Ç', 'ç' -> 'c'
+                    else -> c.lowercaseChar()
+                }
+            )
+        }
+        return sb.toString()
+    }
+
+    private fun devoicedVariants(word: String): Set<String> {
+        if (word.isEmpty()) return setOf(word)
+        val out = mutableSetOf(word)
+        val last = word.last()
+        for ((voiceless, voiced) in devoicingPairs) {
+            if (last == voiceless) out.add(word.dropLast(1) + voiced)
+            if (last == voiced) out.add(word.dropLast(1) + voiceless)
+        }
+        return out
+    }
+
+    // Every string worth testing a title against for a single (already-folded) query word:
+    // itself, its devoiced spelling variants, and the English translation if it's a known
+    // Turkish nation name (checked on the base word and on the devoiced variants, so e.g.
+    // both "Bağdat" and a hypothetical "Bağdad" spelling resolve the same way).
+    private fun searchVariants(word: String): Set<String> {
+        val variants = devoicedVariants(word).toMutableSet()
+        variants.toList().forEach { v -> trCountryNames[v]?.let { variants.add(it) } }
+        return variants
+    }
+
+    private fun titleMatchesQuery(title: String, query: String): Boolean {
+        var q = trFold(query)
+        trPhraseNames.forEach { (tr, en) -> q = q.replace(tr, en) }
+        val parts = q.split(" ").filter { it.isNotBlank() }
+        if (parts.isEmpty()) return true
+        val foldedTitle = trFold(title)
+        return parts.all { part -> searchVariants(part).any { foldedTitle.contains(it) } }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         checkAndGetDomain()
         val homePageLists = mutableListOf<HomePageList>()
@@ -447,10 +565,9 @@ class Cstrsp : MainAPI() {
         val todayMatches = fetchMatches("$apiUrl/matches/all-today")
         val allMatches = (liveMatches + todayMatches).distinctBy { it.id }
         
-        val queryParts = query.split(" ").filter { it.isNotBlank() }
-        results.addAll(allMatches.filter { match -> 
+        results.addAll(allMatches.filter { match ->
             val title = match.title ?: return@filter false
-            queryParts.all { title.contains(it, ignoreCase = true) }
+            titleMatchesQuery(title, query)
         }.mapNotNull { match ->
             val id = match.id ?: return@mapNotNull null
             val title = match.title ?: return@mapNotNull null
@@ -465,8 +582,8 @@ class Cstrsp : MainAPI() {
             ppvRes?.streams?.forEach { category ->
                 category.streams?.forEach { stream ->
                     val title = stream.name ?: "Unknown Event"
-                    
-                    if (title.contains(query, ignoreCase = true)) {
+
+                    if (titleMatchesQuery(title, query)) {
                         val posterUrl = stream.poster?.let {
                             val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
                             "$mainUrl/api/images/proxy/$encoded.webp"
@@ -492,7 +609,7 @@ class Cstrsp : MainAPI() {
             val wfMatches = fetchWFMatches()
             wfMatches?.forEach { match ->
                 val title = match.title ?: "Live Event"
-                if (title.contains(query, ignoreCase = true) && match.matchId != null && !match.streams.isNullOrEmpty()) {
+                if (titleMatchesQuery(title, query) && match.matchId != null && !match.streams.isNullOrEmpty()) {
                     val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
                     results.add(
                         newLiveSearchResponse(
@@ -513,7 +630,7 @@ class Cstrsp : MainAPI() {
             fetchCdnEvents().values.flatten().forEach { event ->
                 val gameId = event.gameID ?: return@forEach
                 val title = cdnTitle(event)
-                if (title.contains(query, ignoreCase = true)) {
+                if (titleMatchesQuery(title, query)) {
                     results.add(
                         newLiveSearchResponse("$title [StreamSports]", "https://cdn.domains/$gameId") {
                             this.posterUrl = cdnPoster(event)
@@ -528,7 +645,7 @@ class Cstrsp : MainAPI() {
             fetchSFStreams().forEach { stream ->
                 val key = stream.streamKey ?: return@forEach
                 val title = stream.name ?: return@forEach
-                if (title.contains(query, ignoreCase = true)) {
+                if (titleMatchesQuery(title, query)) {
                     results.add(
                         newLiveSearchResponse("$title [StreamFree]", "https://sf.domains/$key") {
                             this.posterUrl = stream.thumbnailUrl
@@ -703,7 +820,7 @@ class Cstrsp : MainAPI() {
                     }
                 }
                 
-                iframes.forEach { (name, iframeUrl) ->
+                iframes.resolveConcurrently { (name, iframeUrl) ->
                     loadExtractor(iframeUrl, "https://embedindia.st/", subtitleCallback) { link ->
                         callback(
                             ExtractorLink(
@@ -734,7 +851,7 @@ class Cstrsp : MainAPI() {
                     .filter { it.url != null && !"SD".equals(it.quality, ignoreCase = true) }
                     .sortedBy { it.source == "prime" }
                     .take(15)
-                streams.forEach { stream ->
+                streams.resolveConcurrently { stream ->
                     val name = listOfNotNull(stream.source, stream.quality, stream.language).joinToString(" - ")
                     loadExtractor(stream.url!!, "https://api.watchfooty.st/", subtitleCallback) { link ->
                         callback(
@@ -761,7 +878,7 @@ class Cstrsp : MainAPI() {
             if (event.gameID != null && !event.channels.isNullOrEmpty()) {
                 // Cap channels: an event can carry 100+, and each spawns a WebView extractor.
                 val channels = event.channels.filter { !it.url.isNullOrBlank() }.take(8)
-                channels.forEach { channel ->
+                channels.resolveConcurrently { channel ->
                     val chName = channel.channelName ?: "Channel"
                     loadExtractor(channel.url!!, "https://cdnlivetv.tv/", subtitleCallback) { link ->
                         callback(
@@ -833,41 +950,33 @@ class Cstrsp : MainAPI() {
         }
 
         if (sources != null) {
-            for (source in sources) {
-                try {
-                    // HD only (drop SD streams).
-                    val streams = app.get("$apiUrl/stream/${source.source}/${source.id}")
-                        .parsedSafe<Array<APIStream>>()?.toList()?.filter { it.hd } ?: emptyList()
+            sources.resolveConcurrently { source ->
+                // HD only (drop SD streams).
+                val streams = app.get("$apiUrl/stream/${source.source}/${source.id}")
+                    .parsedSafe<Array<APIStream>>()?.toList()?.filter { it.hd } ?: emptyList()
 
-                    for (stream in streams) {
-                        try {
-                            val langStr = stream.language ?: "Unknown"
-                            val quality = Qualities.P1080.value
-                            val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
-                            val name = "$sourceName - $langStr"
-                            val embedUrl = stream.embedUrl
-    
-                            // Pass the embed URL to our WebView extractor (or built-in extractors)
-                            loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
-                                callback.invoke(
-                                    ExtractorLink(
-                                        source = "$name - Stream ${stream.streamNo}",
-                                        name = "$name - Stream ${stream.streamNo}",
-                                        url = link.url,
-                                        referer = link.referer,
-                                        quality = quality,
-                                        type = link.type,
-                                        headers = link.headers,
-                                        extractorData = link.extractorData
-                                    )
-                                )
-                            }
-                        } catch (e: Exception) {
-                            // Skip stream
-                        }
+                streams.resolveConcurrently { stream ->
+                    val langStr = stream.language ?: "Unknown"
+                    val quality = Qualities.P1080.value
+                    val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
+                    val name = "$sourceName - $langStr"
+                    val embedUrl = stream.embedUrl
+
+                    // Pass the embed URL to our WebView extractor (or built-in extractors)
+                    loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
+                        callback.invoke(
+                            ExtractorLink(
+                                source = "$name - Stream ${stream.streamNo}",
+                                name = "$name - Stream ${stream.streamNo}",
+                                url = link.url,
+                                referer = link.referer,
+                                quality = quality,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData
+                            )
+                        )
                     }
-                } catch (e: Exception) {
-                    // Skip source
                 }
             }
         }
