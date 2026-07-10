@@ -9,18 +9,17 @@
   </h3>
   
   <p>
-    Alternatif olarak, aşağıdaki depo URL'sini kopyalayıp CloudStream ayarlarına yapıştırabilirsiniz:
+    Alternatif olarak, aşağıdaki kısa kodu kullanabilirsiniz veya depo URL'sini kopyalayıp CloudStream ayarlarına yapıştırabilirsiniz:
   </p>
   
   <code>https://raw.githubusercontent.com/ctnkyaumt/cstr-sp/builds/repo.json</code>
 
-  <br><br>
+  <br>
 
-  <p>
-    <strong>strmd.link parser extension</strong>
-  </p>
-
-  ---
+  ## Kısa Kod
+  `cstrsp`
+  
+  <br>
 
   <h1>⚖ DMCA Disclaimer</h1>
   
