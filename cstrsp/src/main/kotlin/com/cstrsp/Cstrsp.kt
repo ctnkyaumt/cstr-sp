@@ -266,45 +266,52 @@ class Cstrsp : MainAPI() {
         else -> Qualities.Unknown.value
     }
 
-    // Resolves a StreamFree embed to a playable link. Returns (url, isM3u8): a direct
-    // m3u8 (isM3u8 = true) for hosted streams, or an external embed url to hand off to
-    // loadExtractor (isM3u8 = false). Null if the stream isn't currently live.
-    private suspend fun resolveStreamFree(key: String, embedUrl: String): Triple<String, Boolean, String>? {
+    // Resolves a StreamFree embed to playable links, one per live quality. Each entry is
+    // (url, isM3u8, quality): a direct m3u8 (isM3u8 = true) for hosted streams, or an
+    // external embed url to hand off to loadExtractor (isM3u8 = false). Empty if the
+    // stream isn't currently live. The embed page's own player defaults to 720p but its
+    // selector offers every quality, and each quality has its own signed URL — so emit
+    // them all instead of just the default, otherwise the app is locked to 720p.
+    private suspend fun resolveStreamFree(key: String, embedUrl: String): List<Triple<String, Boolean, String>> {
         val ref = "$streamfreeUrl/"
         val sk = try {
             app.get("$streamfreeUrl/get-stream-key/$key", referer = ref).parsedSafe<SFStreamKey>()
         } catch (e: Exception) {
             null
-        } ?: return null
+        } ?: return emptyList()
 
-        if (sk.isExternal == true && sk.externalUrl != null) return Triple(sk.externalUrl, false, "720p")
+        if (sk.isExternal == true && sk.externalUrl != null) return listOf(Triple(sk.externalUrl, false, "720p"))
 
         val qualities = try {
             app.get("$streamfreeUrl/api/stream-status/$key", referer = ref).parsedSafe<SFStatus>()?.qualities
         } catch (e: Exception) {
             null
         }.orEmpty()
-        // Match the page's getBestQuality() preference order.
-        val quality = listOf("720p", "1080p", "2160p", "540p").firstOrNull { qualities[it] == true } ?: "720p"
+        val live = listOf("2160p", "1080p", "720p", "540p").filter { qualities[it] == true }
+        // Status endpoint can be empty right at stream start; fall back to probing the
+        // common qualities rather than dropping the stream.
+        val tryQualities = live.ifEmpty { listOf("1080p", "720p") }
 
         val tokens = try {
             val html = app.get(embedUrl, referer = ref).text
-            val json = Regex("const _0x = (\\{.*?\\});").find(html)?.groupValues?.get(1) ?: return null
+            val json = Regex("const _0x = (\\{.*?\\});").find(html)?.groupValues?.get(1) ?: return emptyList()
             AppUtils.parseJson<Map<String, SFToken>>(json)
         } catch (e: Exception) {
-            return null
+            return emptyList()
         }
-        val token = tokens[quality] ?: return null
-        if (token.t == null || token.e == null || token.n == null) return null
 
         val prefix = if ((sk.serverName ?: "origin") != "origin") "live-cdn" else "live"
-        val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
-        // Only emit if the playlist is actually live (upcoming events 404 here).
-        return try {
-            if (app.get(url, referer = ref).text.contains("#EXTM3U")) Triple(url, true, quality) else null
-        } catch (e: Exception) {
-            null
+        val out = mutableListOf<Triple<String, Boolean, String>>()
+        for (quality in tryQualities) {
+            val token = tokens[quality] ?: continue
+            if (token.t == null || token.e == null || token.n == null) continue
+            val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
+            // Only emit if the playlist is actually live (upcoming events 404 here).
+            try {
+                if (app.get(url, referer = ref).text.contains("#EXTM3U")) out.add(Triple(url, true, quality))
+            } catch (e: Exception) {}
         }
+        return out
     }
 
     private fun streamedPoster(match: APIMatch): String? = when {
@@ -914,15 +921,12 @@ class Cstrsp : MainAPI() {
             val stream = AppUtils.parseJson<SFStream>(data)
             val key = stream.streamKey
             if (stream.embedUrl != null && key != null) {
-                val resolved = resolveStreamFree(key, stream.embedUrl)
-                if (resolved != null) {
-                    val (streamUrl, isM3u8, quality) = resolved
-                    val label = "StreamFree - ${stream.name ?: "Live"}"
+                resolveStreamFree(key, stream.embedUrl).forEach { (streamUrl, isM3u8, quality) ->
                     if (isM3u8) {
                         callback(
                             ExtractorLink(
                                 source = "StreamFree",
-                                name = label,
+                                name = "StreamFree - ${stream.name ?: "Live"} $quality",
                                 url = streamUrl,
                                 referer = "$streamfreeUrl/",
                                 quality = sfQuality(quality),
@@ -936,7 +940,7 @@ class Cstrsp : MainAPI() {
                             callback(
                                 ExtractorLink(
                                     source = "StreamFree",
-                                    name = label,
+                                    name = "StreamFree - ${stream.name ?: "Live"}",
                                     url = link.url,
                                     referer = link.referer,
                                     quality = link.quality,
