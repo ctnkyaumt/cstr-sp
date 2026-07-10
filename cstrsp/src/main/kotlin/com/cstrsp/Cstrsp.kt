@@ -263,6 +263,13 @@ class Cstrsp : MainAPI() {
         minOf(dm.widthPixels, dm.heightPixels)
     } catch (_: Exception) { Int.MAX_VALUE }
 
+    // Clamps a Qualities int so it never exceeds the device's display capability.
+    private fun capQuality(quality: Int): Int {
+        if (quality == Qualities.Unknown.value) return quality
+        val maxH = deviceMaxHeight()
+        return if (quality <= maxH) quality else CstrspExtractor.heightToQuality(maxH)
+    }
+
     // WF's quality field is typically "HD" or "SD". "HD" in standard broadcast terminology
     // means 720p (Full HD / FHD is 1080p), so we map accordingly. When the extractor
     // detects the actual resolution from the playlist, that takes priority over this hint.
@@ -857,7 +864,7 @@ class Cstrsp : MainAPI() {
                                 name = "PPV - $name",
                                 url = link.url,
                                 referer = link.referer,
-                                quality = link.quality,
+                                quality = capQuality(link.quality),
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData
@@ -890,7 +897,7 @@ class Cstrsp : MainAPI() {
                                 name = "WF - $name",
                                 url = link.url,
                                 referer = link.referer,
-                                quality = resolvedQuality,
+                                quality = capQuality(resolvedQuality),
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData
@@ -917,7 +924,7 @@ class Cstrsp : MainAPI() {
                                 name = "StreamSports - $chName",
                                 url = link.url,
                                 referer = link.referer,
-                                quality = link.quality,
+                                quality = capQuality(link.quality),
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData
@@ -939,10 +946,10 @@ class Cstrsp : MainAPI() {
                         callback(
                             ExtractorLink(
                                 source = "StreamFree",
-                                name = "StreamFree - ${stream.name ?: "Live"} $quality",
+                                name = "StreamFree - ${stream.name ?: "Live"}",
                                 url = streamUrl,
                                 referer = "$streamfreeUrl/",
-                                quality = sfQuality(quality),
+                                quality = capQuality(sfQuality(quality)),
                                 type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8,
                                 headers = mapOf("Referer" to "$streamfreeUrl/")
                             )
@@ -956,7 +963,7 @@ class Cstrsp : MainAPI() {
                                     name = "StreamFree - ${stream.name ?: "Live"}",
                                     url = link.url,
                                     referer = link.referer,
-                                    quality = link.quality,
+                                    quality = capQuality(link.quality),
                                     type = link.type,
                                     headers = link.headers,
                                     extractorData = link.extractorData
@@ -991,7 +998,9 @@ class Cstrsp : MainAPI() {
                     loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
                         // Use the extractor's detected quality when available;
                         // hd=true just means "not SD" and is typically 720p in practice.
-                        val quality = if (link.quality != Qualities.Unknown.value) link.quality else Qualities.P720.value
+                        val quality = capQuality(
+                            if (link.quality != Qualities.Unknown.value) link.quality else Qualities.P720.value
+                        )
                         callback.invoke(
                             ExtractorLink(
                                 source = "$name - Stream ${stream.streamNo}",
