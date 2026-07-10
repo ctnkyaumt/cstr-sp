@@ -256,12 +256,19 @@ class Cstrsp : MainAPI() {
         else -> Qualities.Unknown.value
     }
 
-    // WF's own docs are inconsistent about the shape of this field ("1080p" in one
-    // example, "hd" in another), but live data shows it's actually always just "HD" or
-    // "SD". We were discarding it entirely and emitting every WF link as Qualities.Unknown
-    // - map it to a real quality instead so e.g. Cloudstream's quality picker shows 1080p.
+    // Returns the shorter display dimension (i.e. video height when played in landscape).
+    // Used to avoid emitting quality options the device can't actually render.
+    private fun deviceMaxHeight(): Int = try {
+        val dm = android.content.res.Resources.getSystem().displayMetrics
+        minOf(dm.widthPixels, dm.heightPixels)
+    } catch (_: Exception) { Int.MAX_VALUE }
+
+    // WF's quality field is typically "HD" or "SD". "HD" in standard broadcast terminology
+    // means 720p (Full HD / FHD is 1080p), so we map accordingly. When the extractor
+    // detects the actual resolution from the playlist, that takes priority over this hint.
     private fun wfQuality(q: String?): Int = when (q?.trim()?.lowercase()) {
-        "hd", "1080p" -> Qualities.P1080.value
+        "1080p" -> Qualities.P1080.value
+        "hd" -> Qualities.P720.value
         "sd" -> Qualities.P480.value
         else -> Qualities.Unknown.value
     }
@@ -287,10 +294,15 @@ class Cstrsp : MainAPI() {
         } catch (e: Exception) {
             null
         }.orEmpty()
-        val live = listOf("2160p", "1080p", "720p", "540p").filter { qualities[it] == true }
+        val maxH = deviceMaxHeight()
+        val live = listOf("2160p", "1080p", "720p", "540p")
+            .filter { qualities[it] == true }
+            .filter { (it.removeSuffix("p").toIntOrNull() ?: 0) <= maxH }
         // Status endpoint can be empty right at stream start; fall back to probing the
         // common qualities rather than dropping the stream.
-        val tryQualities = live.ifEmpty { listOf("1080p", "720p") }
+        val tryQualities = live.ifEmpty {
+            listOf("1080p", "720p").filter { (it.removeSuffix("p").toIntOrNull() ?: 0) <= maxH }
+        }.ifEmpty { listOf("720p") }
 
         val tokens = try {
             val html = app.get(embedUrl, referer = ref).text
@@ -782,7 +794,7 @@ class Cstrsp : MainAPI() {
 
         val posterUrl = streamedPoster(match)
 
-        val sourceNames = match.sources?.mapNotNull { it.source }?.joinToString(", ") { src ->
+        val sourceNames = match.sources?.mapNotNull { it.source }?.sorted()?.joinToString(", ") { src ->
             src.replaceFirstChar { it.uppercase() }
         } ?: ""
         val sourceLabel = if (sourceNames.isNotEmpty()) " [$sourceNames]" else ""
@@ -871,13 +883,14 @@ class Cstrsp : MainAPI() {
                 streams.resolveConcurrently { stream ->
                     val name = listOfNotNull(stream.source, stream.quality, stream.language).joinToString(" - ")
                     loadExtractor(stream.url!!, "https://api.watchfooty.st/", subtitleCallback) { link ->
+                        val resolvedQuality = if (link.quality != Qualities.Unknown.value) link.quality else wfQuality(stream.quality)
                         callback(
                             ExtractorLink(
                                 source = "WF",
                                 name = "WF - $name",
                                 url = link.url,
                                 referer = link.referer,
-                                quality = wfQuality(stream.quality),
+                                quality = resolvedQuality,
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData
@@ -971,13 +984,14 @@ class Cstrsp : MainAPI() {
 
                 streams.resolveConcurrently { stream ->
                     val langStr = stream.language ?: "Unknown"
-                    val quality = Qualities.P1080.value
                     val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
                     val name = "$sourceName - $langStr"
                     val embedUrl = stream.embedUrl
-
                     // Pass the embed URL to our WebView extractor (or built-in extractors)
                     loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
+                        // Use the extractor's detected quality when available;
+                        // hd=true just means "not SD" and is typically 720p in practice.
+                        val quality = if (link.quality != Qualities.Unknown.value) link.quality else Qualities.P720.value
                         callback.invoke(
                             ExtractorLink(
                                 source = "$name - Stream ${stream.streamNo}",

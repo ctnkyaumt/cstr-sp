@@ -33,7 +33,8 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
         val seq: Int,
         val url: String,
         val headers: Map<String, String>,
-        val isMaster: Boolean?
+        val isMaster: Boolean?,
+        val maxHeight: Int? = null
     )
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -115,9 +116,9 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         }
 
                         Thread {
-                            fetchAndCheckResponse(reqUrl, headers) { sourceUrl, outHeaders, isMaster ->
+                            fetchAndCheckResponse(reqUrl, headers) { sourceUrl, outHeaders, isMaster, maxHeight ->
                                 if (!selectionDone.get()) {
-                                    candidates.add(Candidate(seq, sourceUrl, outHeaders, isMaster))
+                                    candidates.add(Candidate(seq, sourceUrl, outHeaders, isMaster, maxHeight))
                                     firstCaptureAt.compareAndSet(0L, System.currentTimeMillis())
                                 }
                             }
@@ -162,7 +163,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         name    = this@CstrspExtractor.name,
                         url     = c.url,
                         referer = c.headers["Referer"] ?: c.headers["referer"] ?: mainUrl,
-                        quality = Qualities.Unknown.value,
+                        quality = heightToQuality(c.maxHeight),
                         type    = ExtractorLinkType.M3U8,
                         headers = c.headers
                     )
@@ -178,13 +179,13 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
         }
     }
 
-    private fun fetchAndCheckResponse(url: String, headers: Map<String, String>?, onResponseCaptured: (url: String, headers: Map<String, String>, isMaster: Boolean?) -> Unit) {
+    private fun fetchAndCheckResponse(url: String, headers: Map<String, String>?, onResponseCaptured: (url: String, headers: Map<String, String>, isMaster: Boolean?, maxHeight: Int?) -> Unit) {
         if (url.contains(".m3u")) {
             // Captured blind, without fetching the body: probing could consume a
             // one-time playback token and break the URL for ExoPlayer. "master" in the
             // URL is a safe hint; anything else stays unknown.
             val isMaster = if (url.contains("master", ignoreCase = true)) true else null
-            onResponseCaptured(url, headers ?: mapOf(), isMaster)
+            onResponseCaptured(url, headers ?: mapOf(), isMaster, null)
             return
         }
 
@@ -232,7 +233,12 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
             if (typeIsM3u8 || body.startsWith("#EXTM")) {
                 val isMaster = body.contains("#EXT-X-STREAM-INF")
-                onResponseCaptured(url, headers ?: mapOf(), isMaster)
+                val maxHeight = if (isMaster) {
+                    RESOLUTION_REGEX.findAll(body)
+                        .mapNotNull { it.groupValues[1].toIntOrNull() }
+                        .maxOrNull()
+                } else null
+                onResponseCaptured(url, headers ?: mapOf(), isMaster, maxHeight)
             }
         } catch (e: Exception) {
             // Ignore connection errors
@@ -241,5 +247,17 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
 
     companion object {
         private const val GRACE_MS = 2000L
+        private val RESOLUTION_REGEX = Regex("""RESOLUTION=\d+x(\d+)""")
+
+        fun heightToQuality(h: Int?): Int = when {
+            h == null -> Qualities.Unknown.value
+            h >= 2160 -> Qualities.P2160.value
+            h >= 1080 -> Qualities.P1080.value
+            h >= 720  -> Qualities.P720.value
+            h >= 480  -> Qualities.P480.value
+            h >= 360  -> Qualities.P360.value
+            h >= 240  -> Qualities.P240.value
+            else      -> Qualities.P144.value
+        }
     }
 }
