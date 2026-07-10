@@ -256,6 +256,16 @@ class Cstrsp : MainAPI() {
         else -> Qualities.Unknown.value
     }
 
+    // WF's own docs are inconsistent about the shape of this field ("1080p" in one
+    // example, "hd" in another), but live data shows it's actually always just "HD" or
+    // "SD". We were discarding it entirely and emitting every WF link as Qualities.Unknown
+    // - map it to a real quality instead so e.g. Cloudstream's quality picker shows 1080p.
+    private fun wfQuality(q: String?): Int = when (q?.trim()?.lowercase()) {
+        "hd", "1080p" -> Qualities.P1080.value
+        "sd" -> Qualities.P480.value
+        else -> Qualities.Unknown.value
+    }
+
     // Resolves a StreamFree embed to a playable link. Returns (url, isM3u8): a direct
     // m3u8 (isM3u8 = true) for hosted streams, or an external embed url to hand off to
     // loadExtractor (isM3u8 = false). Null if the stream isn't currently live.
@@ -860,7 +870,7 @@ class Cstrsp : MainAPI() {
                                 name = "WF - $name",
                                 url = link.url,
                                 referer = link.referer,
-                                quality = link.quality,
+                                quality = wfQuality(stream.quality),
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData

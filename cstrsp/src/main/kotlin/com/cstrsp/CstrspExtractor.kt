@@ -21,10 +21,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 open class CstrspExtractor(override val mainUrl: String, private val context: Context) : ExtractorApi() {
     override val name            = "Cstrsp Extractor (${mainUrl.substringAfter("://").substringBefore("/")})"
     override val requiresReferer = false
-    private lateinit var webView: WebView
 
     @SuppressLint("SetJavaScriptEnabled")
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        // Local, not a class field: this extractor is registered once per domain and
+        // reused, and loadLinks now resolves multiple candidate streams concurrently.
+        // Several of them often share the same embed domain (e.g. one source's stream
+        // numbers 1-6 can all route through embed.st), so a shared webView field would
+        // have one call's cleanup destroy another call's in-flight WebView.
+        lateinit var webView: WebView
         // AtomicBoolean: shouldInterceptRequest fires on a fresh background thread per
         // request, so a plain var here is a TOCTOU race — two in-flight requests (e.g. a
         // master playlist and a variant playlist landing back-to-back) can both pass the
