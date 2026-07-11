@@ -256,18 +256,23 @@ class Cstrsp : MainAPI() {
         else -> Qualities.Unknown.value
     }
 
-    // Returns the shorter display dimension (i.e. video height when played in landscape).
-    // Used to avoid emitting quality options the device can't actually render.
+    // Shorter display dimension (video height when played in landscape). Used to cap the
+    // quality *variants* we offer to what the device can render. Int.MAX_VALUE on failure so
+    // a lookup miss never hides anything.
     private fun deviceMaxHeight(): Int = try {
         val dm = android.content.res.Resources.getSystem().displayMetrics
         minOf(dm.widthPixels, dm.heightPixels)
     } catch (_: Exception) { Int.MAX_VALUE }
 
-    // Clamps a Qualities int so it never exceeds the device's display capability.
-    private fun capQuality(quality: Int): Int {
-        if (quality == Qualities.Unknown.value) return quality
-        val maxH = deviceMaxHeight()
-        return if (quality <= maxH) quality else CstrspExtractor.heightToQuality(maxH)
+    // Appends the resolved quality to a source label, e.g. "WF - alpha" -> "WF - alpha (1080p)",
+    // using CloudStream's own int->label mapping so the name matches the quality badge exactly.
+    // No-op when the quality is unknown, so we never fabricate a resolution we didn't detect.
+    // The device-resolution cap is enforced as an *offer* filter (see resolveStreamFree),
+    // i.e. by not listing redundant above-device variants — NOT by relabeling, which used to
+    // mislabel genuine 1080p streams as 720p on 720p panels. Labels always show the real stream.
+    private fun withQualityLabel(base: String, quality: Int): String {
+        val label = Qualities.getStringByInt(quality)
+        return if (label.isEmpty()) base else "$base ($label)"
     }
 
     // WF's quality field is typically "HD" or "SD". "HD" in standard broadcast terminology
@@ -279,6 +284,14 @@ class Cstrsp : MainAPI() {
         "sd" -> Qualities.P480.value
         else -> Qualities.Unknown.value
     }
+
+    // True when a WF match has at least one playable non-SD stream — i.e. a link that
+    // loadLinks would actually keep. Matches whose only streams are SD (or that have no
+    // usable streams) are hidden from search/home, since they'd resolve to nothing HD.
+    // Mirrors the exact filter used in the WF branch of loadLinks so listing and playback
+    // never disagree.
+    private fun wfHasHd(match: WFMatch): Boolean =
+        match.streams?.any { it.url != null && !"SD".equals(it.quality?.trim(), ignoreCase = true) } == true
 
     // Resolves a StreamFree embed to playable links, one per live quality. Each entry is
     // (url, isM3u8, quality): a direct m3u8 (isM3u8 = true) for hosted streams, or an
@@ -302,14 +315,19 @@ class Cstrsp : MainAPI() {
             null
         }.orEmpty()
         val maxH = deviceMaxHeight()
-        val live = listOf("2160p", "1080p", "720p", "540p")
-            .filter { qualities[it] == true }
-            .filter { (it.removeSuffix("p").toIntOrNull() ?: 0) <= maxH }
-        // Status endpoint can be empty right at stream start; fall back to probing the
-        // common qualities rather than dropping the stream.
-        val tryQualities = live.ifEmpty {
-            listOf("1080p", "720p").filter { (it.removeSuffix("p").toIntOrNull() ?: 0) <= maxH }
-        }.ifEmpty { listOf("720p") }
+        fun fitsDevice(q: String) = (q.removeSuffix("p").toIntOrNull() ?: 0) <= maxH
+        // Highest -> lowest, so the last element is always the lowest available quality.
+        val live = listOf("2160p", "1080p", "720p", "540p").filter { qualities[it] == true }
+        val tryQualities = if (live.isNotEmpty()) {
+            // Offer filter: don't list variants above the device's resolution (a 1080p panel
+            // has no use for the 2160p feed). But never drop the stream entirely — if nothing
+            // fits, keep the single lowest available so the device can still downscale-play it.
+            live.filter { fitsDevice(it) }.ifEmpty { listOf(live.last()) }
+        } else {
+            // Status endpoint can be empty right at stream start; probe the common qualities
+            // (device-capped, with a floor) rather than dropping the stream.
+            listOf("1080p", "720p").filter { fitsDevice(it) }.ifEmpty { listOf("720p") }
+        }
 
         val tokens = try {
             val html = app.get(embedUrl, referer = ref).text
@@ -436,6 +454,12 @@ class Cstrsp : MainAPI() {
         return sb.toString()
     }
 
+    // Turkish-folds, lowercases, and collapses every run of non-alphanumeric characters
+    // (spaces, the hyphen in "motor-sports", punctuation) down to a single space, so titles,
+    // category/sport hints, synonym aliases, and the query all compare on the same footing.
+    private fun normalizeText(s: String): String =
+        trFold(s).replace(Regex("[^a-z0-9]+"), " ").trim()
+
     private fun devoicedVariants(word: String): Set<String> {
         if (word.isEmpty()) return setOf(word)
         val out = mutableSetOf(word)
@@ -457,14 +481,102 @@ class Cstrsp : MainAPI() {
         return variants
     }
 
+    // --- Synonym / alias groups ---------------------------------------------------
+    // Searching any alias in a group matches items whose title OR category/sport/league
+    // contains any other alias in the same group, so "f1", "formula", "formula 1",
+    // "grand prix" (and Turkish "yaris") all find the same events. All aliases are stored
+    // pre-normalized (ascii, lowercase, Turkish-folded, punctuation -> single space) to
+    // match normalizeText(). English + Turkish live together so a Turkish query resolves
+    // the English upstream text.
+    //
+    // Two deliberate patterns:
+    //  - Generic sport words (futbol, basketbol, tenis, yaris...) include the upstream
+    //    *category/sport* token (football, basketball, motor sports...), so they match a
+    //    whole sport even when a title is only "Team A vs Team B".
+    //  - Specific competitions (f1, champions league...) stay title-scoped: they carry no
+    //    broad category token, so "f1" returns Formula 1 events, not every motorsport.
+    private val synonymGroups: List<Set<String>> = listOf(
+        setOf("football", "soccer", "futbol"),
+        setOf("basketball", "basketbol"),
+        setOf("nba"),
+        setOf("american football", "nfl", "amerikan futbolu"),
+        setOf("baseball", "beyzbol", "mlb"),
+        setOf("hockey", "ice hockey", "buz hokeyi", "hokey", "nhl"),
+        setOf("tennis", "tenis"),
+        setOf("volleyball", "voleybol"),
+        setOf("handball", "hentbol"),
+        setOf("rugby", "ragbi"),
+        setOf("cricket", "kriket"),
+        setOf("golf"),
+        setOf("darts", "dart"),
+        setOf("snooker", "billiards", "bilardo"),
+        setOf("boxing", "boks"),
+        setOf("mma", "ufc", "fight", "fighting", "dovus"),
+        setOf("wrestling", "wwe", "gures"),
+        // Motorsport — specific series stay narrow (title-scoped). "gp" is deliberately
+        // omitted: as a substring it hits "motoGP", so "f1" would wrongly match MotoGP.
+        setOf("f1", "formula 1", "formula1", "formula one", "formula", "grand prix"),
+        setOf("motogp", "moto gp", "moto2", "moto3"),
+        setOf("nascar"),
+        setOf("indycar", "indy car"),
+        // Turkish generic "race" -> any motorsport, via the shared category token. Bare
+        // "motor" is omitted (it hits club names like "Motor Lublin"); the "motor sports"
+        // category token and the one-word "motorsport(s)" spellings cover the real data.
+        setOf("yaris", "yarisi", "race", "racing", "motor sports", "motorsport", "motorsports"),
+        // Competitions (title-scoped).
+        setOf("champions league", "ucl", "sampiyonlar ligi", "sampiyonlar"),
+        setOf("europa league", "uel", "avrupa ligi"),
+        setOf("conference league", "konferans ligi"),
+        setOf("premier league", "epl", "premier lig", "ingiltere ligi"),
+        setOf("la liga", "laliga", "ispanya ligi"),
+        setOf("serie a", "italya ligi"),
+        setOf("bundesliga", "almanya ligi"),
+        setOf("ligue 1", "fransa ligi"),
+        setOf("super lig", "super league", "turkiye ligi"),
+        setOf("world cup", "dunya kupasi", "mundial"),
+        setOf("euro", "euros", "european championship", "avrupa sampiyonasi"),
+        // Turkish generic "cup".
+        setOf("kupa", "cup")
+    )
+
+    // alias -> the full set of aliases it can expand to. If an alias appears in more than
+    // one group its expansions are unioned, so it reaches every group it belongs to.
+    private val synonymIndex: Map<String, Set<String>> by lazy {
+        val m = HashMap<String, MutableSet<String>>()
+        for (group in synonymGroups) for (alias in group) {
+            m.getOrPut(alias) { mutableSetOf() }.addAll(group)
+        }
+        m
+    }
+
+    // A title/category blob matches a query when every query token matches — where a token
+    // matches via its own text, its Turkish devoiced/nation variants, or a synonym group it
+    // belongs to. A whole-query synonym hit short-circuits first, so multi-word aliases like
+    // "grand prix" or "champions league" match even though they tokenize into pieces.
     private fun titleMatchesQuery(title: String, query: String): Boolean {
         var q = trFold(query)
         trPhraseNames.forEach { (tr, en) -> q = q.replace(tr, en) }
+        q = q.replace(Regex("[^a-z0-9]+"), " ").trim()
+        if (q.isBlank()) return true
+        val hay = normalizeText(title)
+
+        // Whole-query alias: lets multi-word aliases match without being split into tokens.
+        synonymIndex[q]?.let { group -> if (group.any { hay.contains(it) }) return true }
+
         val parts = q.split(" ").filter { it.isNotBlank() }
         if (parts.isEmpty()) return true
-        val foldedTitle = trFold(title)
-        return parts.all { part -> searchVariants(part).any { foldedTitle.contains(it) } }
+        return parts.all { part ->
+            val variants = searchVariants(part) + (synonymIndex[part] ?: emptySet())
+            variants.any { hay.contains(it) }
+        }
     }
+
+    // Builds the searchable blob for an item from its title plus any category/sport/league
+    // hints, then matches the query against it. Feeding the category in is what lets generic
+    // Turkish sport words (futbol, basketbol, yaris) match a whole sport even when the title
+    // is just two team names.
+    private fun matchesSearch(query: String, vararg fields: String?): Boolean =
+        titleMatchesQuery(fields.filterNotNull().joinToString(" "), query)
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         checkAndGetDomain()
@@ -525,7 +637,7 @@ class Cstrsp : MainAPI() {
             wfMatches?.groupBy { it.sport ?: "Unknown" }?.forEach { (sport, matches) ->
                 val matchList = mutableListOf<SearchResponse>()
                 matches.forEach { match ->
-                    if (match.matchId != null && !match.streams.isNullOrEmpty()) {
+                    if (match.matchId != null && wfHasHd(match)) {
                         val title = match.title ?: "Live Event"
                         val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
                         matchList.add(
@@ -603,7 +715,7 @@ class Cstrsp : MainAPI() {
         
         results.addAll(allMatches.filter { match ->
             val title = match.title ?: return@filter false
-            titleMatchesQuery(title, query)
+            matchesSearch(query, title, match.category)
         }.mapNotNull { match ->
             val id = match.id ?: return@mapNotNull null
             val title = match.title ?: return@mapNotNull null
@@ -619,7 +731,7 @@ class Cstrsp : MainAPI() {
                 category.streams?.forEach { stream ->
                     val title = stream.name ?: "Unknown Event"
 
-                    if (titleMatchesQuery(title, query)) {
+                    if (matchesSearch(query, title, category.category_name, category.category)) {
                         val posterUrl = stream.poster?.let {
                             val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
                             "$mainUrl/api/images/proxy/$encoded.webp"
@@ -645,7 +757,7 @@ class Cstrsp : MainAPI() {
             val wfMatches = fetchWFMatches()
             wfMatches?.forEach { match ->
                 val title = match.title ?: "Live Event"
-                if (titleMatchesQuery(title, query) && match.matchId != null && !match.streams.isNullOrEmpty()) {
+                if (matchesSearch(query, title, match.sport, match.league) && match.matchId != null && wfHasHd(match)) {
                     val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
                     results.add(
                         newLiveSearchResponse(
@@ -663,15 +775,17 @@ class Cstrsp : MainAPI() {
 
         // Search StreamSports (cdnlivetv)
         try {
-            fetchCdnEvents().values.flatten().forEach { event ->
-                val gameId = event.gameID ?: return@forEach
-                val title = cdnTitle(event)
-                if (titleMatchesQuery(title, query)) {
-                    results.add(
-                        newLiveSearchResponse("$title [StreamSports]", "https://cdn.domains/$gameId") {
-                            this.posterUrl = cdnPoster(event)
-                        }
-                    )
+            fetchCdnEvents().forEach { (sport, events) ->
+                events.forEach { event ->
+                    val gameId = event.gameID ?: return@forEach
+                    val title = cdnTitle(event)
+                    if (matchesSearch(query, title, sport)) {
+                        results.add(
+                            newLiveSearchResponse("$title [StreamSports]", "https://cdn.domains/$gameId") {
+                                this.posterUrl = cdnPoster(event)
+                            }
+                        )
+                    }
                 }
             }
         } catch (e: Exception) {}
@@ -681,7 +795,7 @@ class Cstrsp : MainAPI() {
             fetchSFStreams().forEach { stream ->
                 val key = stream.streamKey ?: return@forEach
                 val title = stream.name ?: return@forEach
-                if (titleMatchesQuery(title, query)) {
+                if (matchesSearch(query, title, stream.category, stream.league)) {
                     results.add(
                         newLiveSearchResponse("$title [StreamFree]", "https://sf.domains/$key") {
                             this.posterUrl = stream.thumbnailUrl
@@ -741,7 +855,8 @@ class Cstrsp : MainAPI() {
             val matchId = url.substringAfterLast("/")
             val wfMatches = fetchWFMatches()
             val match = wfMatches?.find { it.matchId == matchId } ?: return null
-            
+            if (!wfHasHd(match)) return null
+
             val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
             val title = match.title ?: "Live Stream"
 
@@ -861,10 +976,10 @@ class Cstrsp : MainAPI() {
                         callback(
                             ExtractorLink(
                                 source = "PPV",
-                                name = "PPV - $name",
+                                name = withQualityLabel("PPV - $name", link.quality),
                                 url = link.url,
                                 referer = link.referer,
-                                quality = capQuality(link.quality),
+                                quality = link.quality,
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData
@@ -888,16 +1003,19 @@ class Cstrsp : MainAPI() {
                     .sortedBy { it.source == "prime" }
                     .take(15)
                 streams.resolveConcurrently { stream ->
-                    val name = listOfNotNull(stream.source, stream.quality, stream.language).joinToString(" - ")
+                    // Build the label from source + language only; the resolution is appended
+                    // from the *detected* quality below, not from WF's static quality hint
+                    // (which is what was mislabeling 1080p feeds as 720p).
+                    val base = listOfNotNull(stream.source, stream.language).joinToString(" - ").ifBlank { "Live" }
                     loadExtractor(stream.url!!, "https://api.watchfooty.st/", subtitleCallback) { link ->
                         val resolvedQuality = if (link.quality != Qualities.Unknown.value) link.quality else wfQuality(stream.quality)
                         callback(
                             ExtractorLink(
                                 source = "WF",
-                                name = "WF - $name",
+                                name = withQualityLabel("WF - $base", resolvedQuality),
                                 url = link.url,
                                 referer = link.referer,
-                                quality = capQuality(resolvedQuality),
+                                quality = resolvedQuality,
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData
@@ -921,10 +1039,10 @@ class Cstrsp : MainAPI() {
                         callback(
                             ExtractorLink(
                                 source = "StreamSports",
-                                name = "StreamSports - $chName",
+                                name = withQualityLabel("StreamSports - $chName", link.quality),
                                 url = link.url,
                                 referer = link.referer,
-                                quality = capQuality(link.quality),
+                                quality = link.quality,
                                 type = link.type,
                                 headers = link.headers,
                                 extractorData = link.extractorData
@@ -941,15 +1059,18 @@ class Cstrsp : MainAPI() {
             val stream = AppUtils.parseJson<SFStream>(data)
             val key = stream.streamKey
             if (stream.embedUrl != null && key != null) {
+                val label = stream.name ?: "Live"
                 resolveStreamFree(key, stream.embedUrl).forEach { (streamUrl, isM3u8, quality) ->
                     if (isM3u8) {
+                        // `quality` here is StreamFree's own authoritative quality string
+                        // (e.g. "1080p") for this signed URL, so use it verbatim in the name.
                         callback(
                             ExtractorLink(
                                 source = "StreamFree",
-                                name = "StreamFree - ${stream.name ?: "Live"}",
+                                name = "StreamFree - $label ($quality)",
                                 url = streamUrl,
                                 referer = "$streamfreeUrl/",
-                                quality = capQuality(sfQuality(quality)),
+                                quality = sfQuality(quality),
                                 type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8,
                                 headers = mapOf("Referer" to "$streamfreeUrl/")
                             )
@@ -960,10 +1081,10 @@ class Cstrsp : MainAPI() {
                             callback(
                                 ExtractorLink(
                                     source = "StreamFree",
-                                    name = "StreamFree - ${stream.name ?: "Live"}",
+                                    name = withQualityLabel("StreamFree - $label", link.quality),
                                     url = link.url,
                                     referer = link.referer,
-                                    quality = capQuality(link.quality),
+                                    quality = link.quality,
                                     type = link.type,
                                     headers = link.headers,
                                     extractorData = link.extractorData
@@ -992,19 +1113,19 @@ class Cstrsp : MainAPI() {
                 streams.resolveConcurrently { stream ->
                     val langStr = stream.language ?: "Unknown"
                     val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
-                    val name = "$sourceName - $langStr"
+                    val base = "$sourceName - $langStr - Stream ${stream.streamNo}"
                     val embedUrl = stream.embedUrl
                     // Pass the embed URL to our WebView extractor (or built-in extractors)
                     loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
-                        // Use the extractor's detected quality when available;
-                        // hd=true just means "not SD" and is typically 720p in practice.
-                        val quality = capQuality(
-                            if (link.quality != Qualities.Unknown.value) link.quality else Qualities.P720.value
-                        )
+                        // Trust the extractor's detected resolution (from the master playlist).
+                        // When it can't be determined we leave it Unknown rather than guessing
+                        // 720p, so we never label a stream with a resolution we didn't measure.
+                        val quality = link.quality
+                        val labeled = withQualityLabel(base, quality)
                         callback.invoke(
                             ExtractorLink(
-                                source = "$name - Stream ${stream.streamNo}",
-                                name = "$name - Stream ${stream.streamNo}",
+                                source = labeled,
+                                name = labeled,
                                 url = link.url,
                                 referer = link.referer,
                                 quality = quality,
