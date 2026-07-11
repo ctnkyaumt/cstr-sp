@@ -95,12 +95,19 @@ class Cstrsp : MainAPI() {
         @JsonProperty("poster") val poster: String? = null,
         @JsonProperty("iframe") val iframe: String? = null,
         @JsonProperty("uri_name") val uri_name: String? = null,
+        // Unix seconds of the event window, plus a 24-7 flag (int 0/1 at stream level).
+        // Used to keep not-yet-started/finished PPV events out of live results.
+        @JsonProperty("starts_at") val startsAt: Long? = null,
+        @JsonProperty("ends_at") val endsAt: Long? = null,
+        @JsonProperty("always_live") val alwaysLive: Int? = null,
         @JsonProperty("substreams") val substreams: List<PPVSubstream>? = null
     )
 
     data class PPVCategory(
         @JsonProperty("category_name") val category_name: String? = null,
         @JsonProperty("category") val category: String? = null,
+        // Category-level 24-7 flag is a JSON boolean (unlike the stream-level int).
+        @JsonProperty("always_live") val alwaysLive: Boolean? = null,
         @JsonProperty("streams") val streams: List<PPVStream>? = null
     )
 
@@ -327,6 +334,21 @@ class Cstrsp : MainAPI() {
     private fun isLiveSf(stream: SFStream): Boolean {
         val ts = stream.matchTimestamp ?: return true
         return ts <= 0L || ts * 1000L <= System.currentTimeMillis()
+    }
+
+    // PPV exposes a [starts_at, ends_at] window (unix seconds) plus a 24-7 flag (boolean on
+    // the category, int 0/1 on the stream). A stream is live now if it's a 24-7 channel, or
+    // it has started and not yet ended. Most PPV entries at any moment are future events, so
+    // this is what keeps upcoming PPV out of search/home. 30-min grace after ends_at absorbs
+    // overruns; missing times fall through to "shown" rather than hiding an unknown.
+    private fun isLivePpv(category: PPVCategory, stream: PPVStream): Boolean {
+        if (category.alwaysLive == true || (stream.alwaysLive ?: 0) == 1) return true
+        val now = System.currentTimeMillis() / 1000L
+        val start = stream.startsAt ?: 0L
+        val end = stream.endsAt ?: 0L
+        if (start > 0L && now < start) return false          // not started yet -> upcoming
+        if (end > 0L && now > end + 1800L) return false        // finished (with overrun grace)
+        return true
     }
 
     // Resolves a StreamFree embed to playable links, one per live quality. Each entry is
@@ -648,7 +670,7 @@ class Cstrsp : MainAPI() {
                         "$mainUrl/api/images/proxy/$encoded.webp"
                     }
                     
-                    if (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty()) {
+                    if (isLivePpv(category, stream) && (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())) {
                         matchList.add(
                             newLiveSearchResponse(
                                 name = "$title [PPV]",
@@ -774,7 +796,7 @@ class Cstrsp : MainAPI() {
                             "$mainUrl/api/images/proxy/$encoded.webp"
                         }
                         
-                        if (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty()) {
+                        if (isLivePpv(category, stream) && (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())) {
                             results.add(
                                 newLiveSearchResponse(
                                     name = "$title [PPV]",
