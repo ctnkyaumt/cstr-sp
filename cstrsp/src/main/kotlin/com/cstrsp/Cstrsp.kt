@@ -436,20 +436,12 @@ class Cstrsp : MainAPI() {
         }
 
         val prefix = if ((sk.serverName ?: "origin") != "origin") "live-cdn" else "live"
-        // Probe every candidate playlist concurrently; awaitAll keeps highest-first order.
-        tryQualities.map { quality ->
-            async {
-                val token = tokens[quality] ?: return@async null
-                if (token.t == null || token.e == null || token.n == null) return@async null
-                val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
-                // Only emit if the playlist is actually live (upcoming events 404 here).
-                try {
-                    if (app.get(url, referer = ref).text.contains("#EXTM3U")) Triple(url, true, quality) else null
-                } catch (e: Exception) {
-                    null
-                }
-            }
-        }.awaitAll().filterNotNull()
+        tryQualities.mapNotNull { quality ->
+            val token = tokens[quality] ?: return@mapNotNull null
+            if (token.t == null || token.e == null || token.n == null) return@mapNotNull null
+            val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
+            Triple(url, true, quality)
+        }
     }
 
     private fun streamedPoster(match: APIMatch): String? = when {
@@ -977,9 +969,46 @@ class Cstrsp : MainAPI() {
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        originalCallback: (ExtractorLink) -> Unit
     ): Boolean {
         checkAndGetDomain()
+        val maxH = deviceMaxHeight()
+        val callback: (ExtractorLink) -> Unit = { link ->
+            try {
+                val linkHeight = when (link.quality) {
+                    Qualities.P2160.value -> 2160
+                    Qualities.P1080.value -> 1080
+                    Qualities.P720.value -> 720
+                    Qualities.P480.value -> 480
+                    Qualities.P360.value -> 360
+                    Qualities.P240.value -> 240
+                    Qualities.P144.value -> 144
+                    else -> 0
+                }
+                val is4k = linkHeight >= 2160 || 
+                           link.name.contains("4k", ignoreCase = true) || 
+                           link.name.contains("2160", ignoreCase = true) ||
+                           link.source.contains("4k", ignoreCase = true) ||
+                           link.source.contains("2160", ignoreCase = true)
+                val is1080p = linkHeight >= 1080 || 
+                              link.name.contains("1080", ignoreCase = true) || 
+                              link.name.contains("fhd", ignoreCase = true) ||
+                              link.source.contains("1080", ignoreCase = true) ||
+                              link.source.contains("fhd", ignoreCase = true)
+                val is720p = linkHeight >= 720 || 
+                             link.name.contains("720", ignoreCase = true) || 
+                             link.name.contains("hd", ignoreCase = true) ||
+                             link.source.contains("720", ignoreCase = true) ||
+                             link.source.contains("hd", ignoreCase = true)
+
+                val shouldFilter = (is4k && maxH < 2160) || (is1080p && maxH < 1080) || (is720p && maxH < 720)
+                if (!shouldFilter) {
+                    originalCallback(link)
+                }
+            } catch (e: Exception) {
+                originalCallback(link)
+            }
+        }
         if (data == TRT_URL) {
             callback.invoke(
                 ExtractorLink(
@@ -1047,11 +1076,21 @@ class Cstrsp : MainAPI() {
                     // (which is what was mislabeling 1080p feeds as 720p).
                     val base = listOfNotNull(stream.source, stream.language).joinToString(" - ").ifBlank { "Live" }
                     loadExtractor(stream.url!!, "https://api.watchfooty.st/", subtitleCallback) { link ->
-                        val resolvedQuality = if (link.quality != Qualities.Unknown.value) link.quality else wfQuality(stream.quality)
+                        var resolvedQuality = if (link.quality != Qualities.Unknown.value) link.quality else wfQuality(stream.quality)
+                        val nameLower = link.name.lowercase()
+                        val urlLower = link.url.lowercase()
+                        val srcLower = (stream.source ?: "").lowercase()
+                        if (resolvedQuality < Qualities.P1080.value) {
+                            if (nameLower.contains("1080") || nameLower.contains("fhd") ||
+                                urlLower.contains("1080") || urlLower.contains("fhd") ||
+                                srcLower.contains("1080") || srcLower.contains("fhd")) {
+                                resolvedQuality = Qualities.P1080.value
+                            }
+                        }
                         callback(
                             ExtractorLink(
                                 source = "WF",
-                                name = withQualityLabel("WF - $base", resolvedQuality),
+                                name = "WF - $base",
                                 url = link.url,
                                 referer = link.referer,
                                 quality = resolvedQuality,
@@ -1152,7 +1191,7 @@ class Cstrsp : MainAPI() {
                     try {
                         app.get("$apiUrl/stream/${source.source}/${source.id}")
                             .parsedSafe<Array<APIStream>>()
-                            ?.filter { it.hd } // HD only (drop SD streams).
+                            ?.take(4) // Cap streams per source to prevent WebView extractors from timing out
                             ?.map { source to it } ?: emptyList()
                     } catch (e: Exception) {
                         emptyList()

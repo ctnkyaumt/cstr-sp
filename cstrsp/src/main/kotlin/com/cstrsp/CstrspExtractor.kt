@@ -180,7 +180,7 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         source  = this@CstrspExtractor.name,
                         name    = this@CstrspExtractor.name,
                         url     = c.url,
-                        referer = c.headers["Referer"] ?: c.headers["referer"] ?: mainUrl,
+                        referer = c.headers["Referer"] ?: c.headers["referer"] ?: url,
                         quality = heightToQuality(c.maxHeight),
                         type    = ExtractorLinkType.M3U8,
                         headers = c.headers
