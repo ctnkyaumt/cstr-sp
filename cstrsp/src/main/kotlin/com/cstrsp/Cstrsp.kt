@@ -172,7 +172,10 @@ class Cstrsp : MainAPI() {
         @JsonProperty("league") val league: String? = null,
         @JsonProperty("stream_key") val streamKey: String? = null,
         @JsonProperty("embed_url") val embedUrl: String? = null,
-        @JsonProperty("thumbnail_url") val thumbnailUrl: String? = null
+        @JsonProperty("thumbnail_url") val thumbnailUrl: String? = null,
+        // Unix seconds of the event start. Absent/0/past = a 24-7 channel (always live);
+        // a future value marks a not-yet-started event we keep out of live results.
+        @JsonProperty("match_timestamp") val matchTimestamp: Long? = null
     )
 
     data class SFResponse(
@@ -292,6 +295,39 @@ class Cstrsp : MainAPI() {
     // never disagree.
     private fun wfHasHd(match: WFMatch): Boolean =
         match.streams?.any { it.url != null && !"SD".equals(it.quality?.trim(), ignoreCase = true) } == true
+
+    // --- "Is this event live right now?" per source ------------------------------
+    // Search (and home) should only surface events that are actually in progress, not
+    // scheduled/upcoming or finished ones. Each upstream exposes a different live signal.
+
+    // WF status is "in" while a match is in progress; "pre" (upcoming), "post*"/finished,
+    // "postponed"/"canceled"/"interrupted" are not playable-live. Accept "in" (and "live"
+    // defensively); note "interrupted" must NOT be treated as live even though it starts
+    // with "in", so this is an exact match, not a prefix.
+    private fun isLiveWf(match: WFMatch): Boolean =
+        match.status?.trim()?.lowercase().let { it == "in" || it == "live" }
+
+    // cdnlivetv event status uses short codes: "NS" (not started/upcoming) and "CANC"
+    // (cancelled) are the non-live ones we've observed; finished/postponed codes are added
+    // for safety. Anything else (in-play codes, or an unknown/blank status on a channel that
+    // has a playable feed) is treated as live so we never hide a genuinely live event.
+    private val cdnNotLiveStatuses = setOf(
+        "ns", "tbd", "canc", "cancl", "cancelled", "canceled", "pst", "postp", "postponed",
+        "abd", "abandoned", "susp", "suspended", "wo", "awd", "ft", "aet", "pen", "fin", "finished", "ended"
+    )
+    private fun isLiveCdn(event: CdnEvent): Boolean {
+        val s = event.status?.trim()?.lowercase() ?: return true
+        return s.isEmpty() || s !in cdnNotLiveStatuses
+    }
+
+    // StreamFree: a 24-7 channel has no/zero/past match_timestamp (always live); a future
+    // timestamp is a not-yet-started event. We can't detect "finished" (no end time), but
+    // resolveStreamFree only yields links for a currently-live playlist, so stale entries
+    // simply resolve to nothing — the important case here is hiding upcoming events.
+    private fun isLiveSf(stream: SFStream): Boolean {
+        val ts = stream.matchTimestamp ?: return true
+        return ts <= 0L || ts * 1000L <= System.currentTimeMillis()
+    }
 
     // Resolves a StreamFree embed to playable links, one per live quality. Each entry is
     // (url, isM3u8, quality): a direct m3u8 (isM3u8 = true) for hosted streams, or an
@@ -637,7 +673,7 @@ class Cstrsp : MainAPI() {
             wfMatches?.groupBy { it.sport ?: "Unknown" }?.forEach { (sport, matches) ->
                 val matchList = mutableListOf<SearchResponse>()
                 matches.forEach { match ->
-                    if (match.matchId != null && wfHasHd(match)) {
+                    if (match.matchId != null && wfHasHd(match) && isLiveWf(match)) {
                         val title = match.title ?: "Live Event"
                         val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
                         matchList.add(
@@ -663,6 +699,7 @@ class Cstrsp : MainAPI() {
             fetchCdnEvents().forEach { (sport, events) ->
                 val matchList = events.mapNotNull { event ->
                     val gameId = event.gameID ?: return@mapNotNull null
+                    if (!isLiveCdn(event)) return@mapNotNull null
                     newLiveSearchResponse("${cdnTitle(event)} [StreamSports]", "https://cdn.domains/$gameId") {
                         this.posterUrl = cdnPoster(event)
                     }
@@ -677,7 +714,7 @@ class Cstrsp : MainAPI() {
 
         // StreamFree (streamfree.top) Backup Source
         try {
-            fetchSFStreams().groupBy { it.category ?: "Other" }.forEach { (category, streams) ->
+            fetchSFStreams().filter { isLiveSf(it) }.groupBy { it.category ?: "Other" }.forEach { (category, streams) ->
                 val matchList = streams.mapNotNull { stream ->
                     val key = stream.streamKey ?: return@mapNotNull null
                     newLiveSearchResponse("${stream.name} [StreamFree]", "https://sf.domains/$key") {
@@ -708,11 +745,11 @@ class Cstrsp : MainAPI() {
             }
         )
 
-        // Search Streamed.pk
+        // Search Streamed.pk — live only. /matches/all-today also returns not-yet-started
+        // matches, which we deliberately keep out of search results (only /matches/live).
         val liveMatches = fetchMatches("$apiUrl/matches/live")
-        val todayMatches = fetchMatches("$apiUrl/matches/all-today")
-        val allMatches = (liveMatches + todayMatches).distinctBy { it.id }
-        
+        val allMatches = liveMatches.distinctBy { it.id }
+
         results.addAll(allMatches.filter { match ->
             val title = match.title ?: return@filter false
             matchesSearch(query, title, match.category)
@@ -757,7 +794,7 @@ class Cstrsp : MainAPI() {
             val wfMatches = fetchWFMatches()
             wfMatches?.forEach { match ->
                 val title = match.title ?: "Live Event"
-                if (matchesSearch(query, title, match.sport, match.league) && match.matchId != null && wfHasHd(match)) {
+                if (matchesSearch(query, title, match.sport, match.league) && match.matchId != null && wfHasHd(match) && isLiveWf(match)) {
                     val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
                     results.add(
                         newLiveSearchResponse(
@@ -779,7 +816,7 @@ class Cstrsp : MainAPI() {
                 events.forEach { event ->
                     val gameId = event.gameID ?: return@forEach
                     val title = cdnTitle(event)
-                    if (matchesSearch(query, title, sport)) {
+                    if (isLiveCdn(event) && matchesSearch(query, title, sport)) {
                         results.add(
                             newLiveSearchResponse("$title [StreamSports]", "https://cdn.domains/$gameId") {
                                 this.posterUrl = cdnPoster(event)
@@ -795,7 +832,7 @@ class Cstrsp : MainAPI() {
             fetchSFStreams().forEach { stream ->
                 val key = stream.streamKey ?: return@forEach
                 val title = stream.name ?: return@forEach
-                if (matchesSearch(query, title, stream.category, stream.league)) {
+                if (isLiveSf(stream) && matchesSearch(query, title, stream.category, stream.league)) {
                     results.add(
                         newLiveSearchResponse("$title [StreamFree]", "https://sf.domains/$key") {
                             this.posterUrl = stream.thumbnailUrl
