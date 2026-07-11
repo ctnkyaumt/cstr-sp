@@ -10,8 +10,15 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+
+private const val CACHE_TTL_MS = 30_000L
+private const val TRT_URL = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
+private const val TRT_POSTER =
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
 
 class Cstrsp : MainAPI() {
     override var mainUrl = "https://streamed.pk"
@@ -27,6 +34,29 @@ class Cstrsp : MainAPI() {
     private var isDomainChecked = false
     private val domains = listOf("https://streamed.pk", "https://streamed.st")
 
+    // Short-lived response cache. A normal flow (home/search -> click -> play) hits the
+    // same upstream list APIs three times within seconds; only the first call should pay
+    // the network round-trip. Failures are never cached, so a flaky source retries on the
+    // next call instead of negative-caching for the TTL.
+    private val cacheMutex = Mutex()
+    private val apiCache = HashMap<String, Pair<Long, Any>>()
+
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun <T : Any> cached(key: String, fetch: suspend () -> T?): T? {
+        cacheMutex.withLock {
+            apiCache[key]?.let { (at, value) ->
+                if (System.currentTimeMillis() - at < CACHE_TTL_MS) return value as T
+            }
+        }
+        val fresh = try { fetch() } catch (e: Exception) { null } ?: return null
+        cacheMutex.withLock { apiCache[key] = System.currentTimeMillis() to fresh }
+        return fresh
+    }
+
+    private suspend fun putCache(key: String, value: Any) {
+        cacheMutex.withLock { apiCache[key] = System.currentTimeMillis() to value }
+    }
+
     private suspend fun checkAndGetDomain() {
         if (isDomainChecked) return
         for (domain in domains) {
@@ -36,6 +66,11 @@ class Cstrsp : MainAPI() {
                     mainUrl = domain
                     apiUrl = "$domain/api"
                     isDomainChecked = true
+                    // The probe body IS the live-matches list; seed the cache so the
+                    // fetch that immediately follows doesn't repeat the same request.
+                    response.parsedSafe<Array<APIMatch>>()?.toList()
+                        ?.filter { it.id != null && it.title != null }
+                        ?.let { putCache("$apiUrl/matches/live", it) }
                     return
                 }
             } catch (e: Exception) {}
@@ -211,52 +246,50 @@ class Cstrsp : MainAPI() {
 
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
 
-    private suspend fun fetchPPVApi(): PPVResponse? {
-        for (domain in ppvDomains) {
+    private val sfTokenRegex = Regex("const _0x = (\\{.*?\\});")
+
+    private suspend fun fetchPPVApi(): PPVResponse? = cached("ppv") {
+        ppvDomains.firstNotNullOfOrNull { domain ->
             try {
-                val url = "https://$domain/api/streams"
-                val res = app.get(url).parsedSafe<PPVResponse>()
-                if (res?.streams != null) return res
-            } catch (e: Exception) {}
+                app.get("https://$domain/api/streams").parsedSafe<PPVResponse>()?.takeIf { it.streams != null }
+            } catch (e: Exception) {
+                null
+            }
         }
-        return null
     }
 
-    private suspend fun fetchWFMatches(): List<WFMatch>? {
-        return try {
-            app.get("https://api.watchfooty.st/api/v1/matches/all").parsedSafe<Array<WFMatch>>()?.toList()
-        } catch (e: Exception) {
-            null
-        }
-    }
+    private suspend fun fetchWFMatches(): List<WFMatch> = cached("wf") {
+        app.get("https://api.watchfooty.st/api/v1/matches/all").parsedSafe<Array<WFMatch>>()?.toList()
+    } ?: emptyList()
 
     // Returns sport -> events, keeping only events that currently have a playable channel.
-    private suspend fun fetchCdnEvents(): Map<String, List<CdnEvent>> {
-        val res = try {
-            app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").parsedSafe<CdnResponse>()
-        } catch (e: Exception) {
-            null
-        } ?: return emptyMap()
-
+    private suspend fun fetchCdnEvents(): Map<String, List<CdnEvent>> = cached("cdn") {
+        val res = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").parsedSafe<CdnResponse>()
+            ?: return@cached null
         val out = LinkedHashMap<String, List<CdnEvent>>()
         res.data?.forEach { (sport, value) ->
             val raw = value as? List<*> ?: return@forEach // skip scalar metadata keys
-            val events = raw.mapNotNull { el ->
-                try { AppUtils.parseJson<CdnEvent>((el ?: return@mapNotNull null).toJson()) } catch (e: Exception) { null }
+            // One serialize->parse round-trip for the whole sport array (they can hold
+            // 1000+ events) instead of one per event.
+            val events = try {
+                AppUtils.parseJson<Array<CdnEvent>>(raw.toJson()).toList()
+            } catch (e: Exception) {
+                emptyList()
             }.filter { ev -> ev.gameID != null && ev.channels?.any { !it.url.isNullOrBlank() } == true }
             if (events.isNotEmpty()) out[sport] = events
         }
-        return out
-    }
+        out
+    } ?: emptyMap()
 
-    private suspend fun fetchSFStreams(): List<SFStream> {
-        return try {
-            app.get("$streamfreeUrl/api/v1/streams").parsedSafe<SFResponse>()?.streams
-                ?.filter { it.name != null && it.embedUrl != null && it.streamKey != null } ?: emptyList()
-        } catch (e: Exception) {
-            emptyList()
-        }
-    }
+    private suspend fun fetchSFStreams(): List<SFStream> = cached("sf") {
+        app.get("$streamfreeUrl/api/v1/streams").parsedSafe<SFResponse>()?.streams
+            ?.filter { it.name != null && it.embedUrl != null && it.streamKey != null }
+    } ?: emptyList()
+
+    // Helper to fetch matches from streamed.pk
+    private suspend fun fetchMatches(endpoint: String): List<APIMatch> = cached(endpoint) {
+        app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList()?.filter { it.id != null && it.title != null }
+    } ?: emptyList()
 
     private fun sfQuality(q: String): Int = when (q) {
         "2160p" -> Qualities.P2160.value
@@ -357,21 +390,36 @@ class Cstrsp : MainAPI() {
     // stream isn't currently live. The embed page's own player defaults to 720p but its
     // selector offers every quality, and each quality has its own signed URL — so emit
     // them all instead of just the default, otherwise the app is locked to 720p.
-    private suspend fun resolveStreamFree(key: String, embedUrl: String): List<Triple<String, Boolean, String>> {
+    private suspend fun resolveStreamFree(key: String, embedUrl: String): List<Triple<String, Boolean, String>> = coroutineScope {
         val ref = "$streamfreeUrl/"
         val sk = try {
             app.get("$streamfreeUrl/get-stream-key/$key", referer = ref).parsedSafe<SFStreamKey>()
         } catch (e: Exception) {
             null
-        } ?: return emptyList()
+        } ?: return@coroutineScope emptyList()
 
-        if (sk.isExternal == true && sk.externalUrl != null) return listOf(Triple(sk.externalUrl, false, "720p"))
+        if (sk.isExternal == true && sk.externalUrl != null) return@coroutineScope listOf(Triple(sk.externalUrl, false, "720p"))
 
-        val qualities = try {
-            app.get("$streamfreeUrl/api/stream-status/$key", referer = ref).parsedSafe<SFStatus>()?.qualities
-        } catch (e: Exception) {
-            null
-        }.orEmpty()
+        // The status endpoint and the embed page (token map) are independent — fetch both
+        // concurrently instead of back to back.
+        val qualitiesDeferred = async {
+            try {
+                app.get("$streamfreeUrl/api/stream-status/$key", referer = ref).parsedSafe<SFStatus>()?.qualities
+            } catch (e: Exception) {
+                null
+            }.orEmpty()
+        }
+        val tokensDeferred = async {
+            try {
+                val html = app.get(embedUrl, referer = ref).text
+                sfTokenRegex.find(html)?.groupValues?.get(1)?.let { AppUtils.parseJson<Map<String, SFToken>>(it) }
+            } catch (e: Exception) {
+                null
+            }
+        }
+        val qualities = qualitiesDeferred.await()
+        val tokens = tokensDeferred.await() ?: return@coroutineScope emptyList()
+
         val maxH = deviceMaxHeight()
         fun fitsDevice(q: String) = (q.removeSuffix("p").toIntOrNull() ?: 0) <= maxH
         // Highest -> lowest, so the last element is always the lowest available quality.
@@ -387,26 +435,21 @@ class Cstrsp : MainAPI() {
             listOf("1080p", "720p").filter { fitsDevice(it) }.ifEmpty { listOf("720p") }
         }
 
-        val tokens = try {
-            val html = app.get(embedUrl, referer = ref).text
-            val json = Regex("const _0x = (\\{.*?\\});").find(html)?.groupValues?.get(1) ?: return emptyList()
-            AppUtils.parseJson<Map<String, SFToken>>(json)
-        } catch (e: Exception) {
-            return emptyList()
-        }
-
         val prefix = if ((sk.serverName ?: "origin") != "origin") "live-cdn" else "live"
-        val out = mutableListOf<Triple<String, Boolean, String>>()
-        for (quality in tryQualities) {
-            val token = tokens[quality] ?: continue
-            if (token.t == null || token.e == null || token.n == null) continue
-            val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
-            // Only emit if the playlist is actually live (upcoming events 404 here).
-            try {
-                if (app.get(url, referer = ref).text.contains("#EXTM3U")) out.add(Triple(url, true, quality))
-            } catch (e: Exception) {}
-        }
-        return out
+        // Probe every candidate playlist concurrently; awaitAll keeps highest-first order.
+        tryQualities.map { quality ->
+            async {
+                val token = tokens[quality] ?: return@async null
+                if (token.t == null || token.e == null || token.n == null) return@async null
+                val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
+                // Only emit if the playlist is actually live (upcoming events 404 here).
+                try {
+                    if (app.get(url, referer = ref).text.contains("#EXTM3U")) Triple(url, true, quality) else null
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        }.awaitAll().filterNotNull()
     }
 
     private fun streamedPoster(match: APIMatch): String? = when {
@@ -420,14 +463,45 @@ class Cstrsp : MainAPI() {
 
     private fun cdnPoster(event: CdnEvent): String? = event.homeTeamImg ?: event.eventImg
 
-    // Helper to fetch matches from streamed.pk
-    private suspend fun fetchMatches(endpoint: String): List<APIMatch> {
-        return try {
-            app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList()?.filter { it.id != null && it.title != null } ?: emptyList()
-        } catch (e: Exception) {
-            emptyList()
-        }
+    // --- Per-source item builders (shared by home + search) ------------------------
+
+    private fun ppvPoster(stream: PPVStream): String? = stream.poster?.let {
+        val encoded = android.util.Base64.encodeToString(
+            it.toByteArray(),
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
+        )
+        "$mainUrl/api/images/proxy/$encoded.webp"
     }
+
+    // Live now, has something to play, and has an id we can find again in load().
+    private fun ppvListable(category: PPVCategory, stream: PPVStream): Boolean =
+        stream.id != null && isLivePpv(category, stream) &&
+            (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())
+
+    private fun ppvItem(stream: PPVStream): SearchResponse =
+        newLiveSearchResponse("${stream.name ?: "Unknown Event"} [PPV]", "https://ppv.domains/${stream.id}") {
+            this.posterUrl = ppvPoster(stream)
+        }
+
+    private fun wfPoster(match: WFMatch): String? = match.poster?.let { "https://api.watchfooty.st$it" }
+
+    private fun wfListable(match: WFMatch): Boolean =
+        match.matchId != null && wfHasHd(match) && isLiveWf(match)
+
+    private fun wfItem(match: WFMatch): SearchResponse =
+        newLiveSearchResponse("${match.title ?: "Live Event"} [WF]", "https://wf.domains/${match.matchId}") {
+            this.posterUrl = wfPoster(match)
+        }
+
+    private fun cdnItem(event: CdnEvent): SearchResponse =
+        newLiveSearchResponse("${cdnTitle(event)} [StreamSports]", "https://cdn.domains/${event.gameID}") {
+            this.posterUrl = cdnPoster(event)
+        }
+
+    private fun sfItem(stream: SFStream): SearchResponse =
+        newLiveSearchResponse("${stream.name} [StreamFree]", "https://sf.domains/${stream.streamKey}") {
+            this.posterUrl = stream.thumbnailUrl
+        }
 
     // Resolves candidates (WebView-based loadExtractor calls) with bounded concurrency
     // instead of one at a time. Each call can take up to ~15s to time out, so resolving a
@@ -448,6 +522,14 @@ class Cstrsp : MainAPI() {
             }
         }.awaitAll()
         Unit
+    }
+
+    // Isolates one source: a failure yields an empty list instead of killing the others.
+    private suspend fun <T> safeList(block: suspend () -> List<T>): List<T> = try {
+        block()
+    } catch (e: Exception) {
+        e.printStackTrace()
+        emptyList()
     }
 
     // --- Turkish search support ---------------------------------------------------
@@ -512,11 +594,13 @@ class Cstrsp : MainAPI() {
         return sb.toString()
     }
 
+    private val nonAlnumRegex = Regex("[^a-z0-9]+")
+
     // Turkish-folds, lowercases, and collapses every run of non-alphanumeric characters
     // (spaces, the hyphen in "motor-sports", punctuation) down to a single space, so titles,
     // category/sport hints, synonym aliases, and the query all compare on the same footing.
     private fun normalizeText(s: String): String =
-        trFold(s).replace(Regex("[^a-z0-9]+"), " ").trim()
+        trFold(s).replace(nonAlnumRegex, " ").trim()
 
     private fun devoicedVariants(word: String): Set<String> {
         if (word.isEmpty()) return setOf(word)
@@ -607,275 +691,189 @@ class Cstrsp : MainAPI() {
         m
     }
 
-    // A title/category blob matches a query when every query token matches — where a token
-    // matches via its own text, its Turkish devoiced/nation variants, or a synonym group it
-    // belongs to. A whole-query synonym hit short-circuits first, so multi-word aliases like
+    // Precomputes the query side of matching once per search — folding, phrase translation,
+    // tokenization, and the variant/synonym set of every token — instead of redoing all of
+    // it for each of the (possibly thousands of) candidate titles.
+    //
+    // A title/category blob matches when every query token matches — where a token matches
+    // via its own text, its Turkish devoiced/nation variants, or a synonym group it belongs
+    // to. A whole-query synonym hit short-circuits first, so multi-word aliases like
     // "grand prix" or "champions league" match even though they tokenize into pieces.
-    private fun titleMatchesQuery(title: String, query: String): Boolean {
-        var q = trFold(query)
-        trPhraseNames.forEach { (tr, en) -> q = q.replace(tr, en) }
-        q = q.replace(Regex("[^a-z0-9]+"), " ").trim()
-        if (q.isBlank()) return true
-        val hay = normalizeText(title)
+    private inner class QueryMatcher(query: String) {
+        private val q: String
+        private val wholeQueryAliases: Set<String>?
+        private val tokenVariants: List<Set<String>>
 
-        // Whole-query alias: lets multi-word aliases match without being split into tokens.
-        synonymIndex[q]?.let { group -> if (group.any { hay.contains(it) }) return true }
+        init {
+            var s = trFold(query)
+            trPhraseNames.forEach { (tr, en) -> s = s.replace(tr, en) }
+            q = s.replace(nonAlnumRegex, " ").trim()
+            wholeQueryAliases = synonymIndex[q]
+            tokenVariants = q.split(" ").filter { it.isNotBlank() }
+                .map { part -> searchVariants(part) + (synonymIndex[part] ?: emptySet()) }
+        }
 
-        val parts = q.split(" ").filter { it.isNotBlank() }
-        if (parts.isEmpty()) return true
-        return parts.all { part ->
-            val variants = searchVariants(part) + (synonymIndex[part] ?: emptySet())
-            variants.any { hay.contains(it) }
+        // Fields = title plus any category/sport/league hints. Feeding the category in is
+        // what lets generic Turkish sport words (futbol, basketbol, yaris) match a whole
+        // sport even when the title is just two team names.
+        fun matches(vararg fields: String?): Boolean {
+            if (q.isBlank()) return true
+            val hay = normalizeText(fields.filterNotNull().joinToString(" "))
+            // Whole-query alias: lets multi-word aliases match without being split into tokens.
+            wholeQueryAliases?.let { group -> if (group.any { hay.contains(it) }) return true }
+            if (tokenVariants.isEmpty()) return true
+            return tokenVariants.all { variants -> variants.any { hay.contains(it) } }
         }
     }
 
-    // Builds the searchable blob for an item from its title plus any category/sport/league
-    // hints, then matches the query against it. Feeding the category in is what lets generic
-    // Turkish sport words (futbol, basketbol, yaris) match a whole sport even when the title
-    // is just two team names.
-    private fun matchesSearch(query: String, vararg fields: String?): Boolean =
-        titleMatchesQuery(fields.filterNotNull().joinToString(" "), query)
+    // --- Home ----------------------------------------------------------------------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         checkAndGetDomain()
-        val homePageLists = mutableListOf<HomePageList>()
+        // All five upstreams fetched concurrently — one slow or dead source no longer
+        // delays the whole home page. awaitAll preserves order, so sections stay stable:
+        // Streamed, PPV, WF, StreamSports, StreamFree.
+        val sections = coroutineScope {
+            listOf(
+                async { safeList { streamedHomeSections() } },
+                async { safeList { ppvHomeSections() } },
+                async { safeList { wfHomeSections() } },
+                async { safeList { cdnHomeSections() } },
+                async { safeList { sfHomeSections() } }
+            ).awaitAll()
+        }.flatten()
+        return newHomePageResponse(sections)
+    }
 
-        // 1. Fetch Streamed.pk (Main Source)
-        val mainMatches = fetchMatches("$apiUrl/matches/live")
-        mainMatches.groupBy { it.category }.forEach { (category, matches) ->
-            val list = matches.mapNotNull { match ->
+    private suspend fun streamedHomeSections(): List<HomePageList> =
+        fetchMatches("$apiUrl/matches/live")
+            .groupBy { it.category ?: "Other" }
+            .mapNotNull { (category, matches) ->
+                val items = matches.mapNotNull { match ->
+                    val id = match.id ?: return@mapNotNull null
+                    val title = match.title ?: return@mapNotNull null
+                    newLiveSearchResponse(title, "$mainUrl/match/$id") {
+                        this.posterUrl = streamedPoster(match)
+                    }
+                }
+                if (items.isEmpty()) null
+                else HomePageList("${category.replaceFirstChar { it.uppercase() }} [Streamed]", items)
+            }
+
+    private suspend fun ppvHomeSections(): List<HomePageList> =
+        fetchPPVApi()?.streams.orEmpty().mapNotNull { category ->
+            val items = category.streams.orEmpty()
+                .filter { ppvListable(category, it) }
+                .map { ppvItem(it) }
+            if (items.isEmpty()) null
+            else HomePageList("${category.category_name ?: category.category ?: "Unknown"} [PPV]", items)
+        }
+
+    private suspend fun wfHomeSections(): List<HomePageList> =
+        fetchWFMatches()
+            .filter { wfListable(it) }
+            .groupBy { it.sport ?: "Unknown" }
+            .map { (sport, matches) ->
+                HomePageList("${sport.replaceFirstChar { it.uppercase() }} [WF]", matches.map { wfItem(it) })
+            }
+
+    private suspend fun cdnHomeSections(): List<HomePageList> =
+        fetchCdnEvents().mapNotNull { (sport, events) ->
+            val items = events.filter { isLiveCdn(it) }.map { cdnItem(it) }
+            if (items.isEmpty()) null
+            else HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", items)
+        }
+
+    private suspend fun sfHomeSections(): List<HomePageList> =
+        fetchSFStreams()
+            .filter { isLiveSf(it) }
+            .groupBy { it.category ?: "Other" }
+            .map { (category, streams) ->
+                HomePageList("${category.replaceFirstChar { it.uppercase() }} [StreamFree]", streams.map { sfItem(it) })
+            }
+
+    // --- Search ----------------------------------------------------------------------
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        checkAndGetDomain()
+        val matcher = QueryMatcher(query)
+        val results = mutableListOf<SearchResponse>()
+
+        results.add(
+            newLiveSearchResponse(name = "TRT Yayını", url = TRT_URL) {
+                this.posterUrl = TRT_POSTER
+            }
+        )
+
+        // Same concurrency + ordering rationale as getMainPage.
+        coroutineScope {
+            listOf(
+                async { safeList { searchStreamed(matcher) } },
+                async { safeList { searchPpv(matcher) } },
+                async { safeList { searchWf(matcher) } },
+                async { safeList { searchCdn(matcher) } },
+                async { safeList { searchSf(matcher) } }
+            ).awaitAll()
+        }.forEach { results.addAll(it) }
+
+        return results
+    }
+
+    // Streamed.pk — live only. /matches/all-today also returns not-yet-started matches,
+    // which we deliberately keep out of search results (only /matches/live).
+    private suspend fun searchStreamed(matcher: QueryMatcher): List<SearchResponse> =
+        fetchMatches("$apiUrl/matches/live")
+            .distinctBy { it.id }
+            .filter { it.title != null && matcher.matches(it.title, it.category) }
+            .mapNotNull { match ->
                 val id = match.id ?: return@mapNotNull null
                 val title = match.title ?: return@mapNotNull null
                 newLiveSearchResponse(title, "$mainUrl/match/$id") {
                     this.posterUrl = streamedPoster(match)
                 }
             }
-            if (list.isNotEmpty()) {
-                val catName = category ?: "Other"
-                homePageLists.add(HomePageList("${catName.replaceFirstChar { it.uppercase() }} [Streamed]", list))
-            }
+
+    private suspend fun searchPpv(matcher: QueryMatcher): List<SearchResponse> =
+        fetchPPVApi()?.streams.orEmpty().flatMap { category ->
+            category.streams.orEmpty()
+                .filter { stream ->
+                    ppvListable(category, stream) &&
+                        matcher.matches(stream.name ?: "Unknown Event", category.category_name, category.category)
+                }
+                .map { ppvItem(it) }
         }
 
-        // 2. Fetch PPV Domains (Backup Source)
-        try {
-            val ppvRes = fetchPPVApi()
-            ppvRes?.streams?.forEach { category ->
-                val catName = category.category_name ?: category.category ?: "Unknown"
-                val matchList = mutableListOf<SearchResponse>()
-                
-                category.streams?.forEach { stream ->
-                    val title = stream.name ?: "Unknown Event"
-                    val posterUrl = stream.poster?.let {
-                        val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
-                        "$mainUrl/api/images/proxy/$encoded.webp"
-                    }
-                    
-                    if (isLivePpv(category, stream) && (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())) {
-                        matchList.add(
-                            newLiveSearchResponse(
-                                name = "$title [PPV]",
-                                url = "https://ppv.domains/${stream.id}"
-                            ) {
-                                this.posterUrl = posterUrl
-                            }
-                        )
-                    }
-                }
-                if (matchList.isNotEmpty()) {
-                    homePageLists.add(HomePageList("$catName [PPV]", matchList))
-                }
+    private suspend fun searchWf(matcher: QueryMatcher): List<SearchResponse> =
+        fetchWFMatches()
+            .filter { match ->
+                wfListable(match) && matcher.matches(match.title ?: "Live Event", match.sport, match.league)
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+            .map { wfItem(it) }
+
+    private suspend fun searchCdn(matcher: QueryMatcher): List<SearchResponse> =
+        fetchCdnEvents().flatMap { (sport, events) ->
+            events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport) }.map { cdnItem(it) }
         }
 
-        // Handle WF Streams
-        try {
-            val wfMatches = fetchWFMatches()
-            wfMatches?.groupBy { it.sport ?: "Unknown" }?.forEach { (sport, matches) ->
-                val matchList = mutableListOf<SearchResponse>()
-                matches.forEach { match ->
-                    if (match.matchId != null && wfHasHd(match) && isLiveWf(match)) {
-                        val title = match.title ?: "Live Event"
-                        val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
-                        matchList.add(
-                            newLiveSearchResponse(
-                                name = "$title [WF]",
-                                url = "https://wf.domains/${match.matchId}"
-                            ) {
-                                this.posterUrl = posterUrl
-                            }
-                        )
-                    }
-                }
-                if (matchList.isNotEmpty()) {
-                    homePageLists.add(HomePageList("${sport.replaceFirstChar { it.uppercase() }} [WF]", matchList))
-                }
+    private suspend fun searchSf(matcher: QueryMatcher): List<SearchResponse> =
+        fetchSFStreams()
+            .filter { stream ->
+                stream.name != null && isLiveSf(stream) &&
+                    matcher.matches(stream.name, stream.category, stream.league)
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+            .map { sfItem(it) }
 
-        // StreamSports (cdnlivetv.tv) Backup Source
-        try {
-            fetchCdnEvents().forEach { (sport, events) ->
-                val matchList = events.mapNotNull { event ->
-                    val gameId = event.gameID ?: return@mapNotNull null
-                    if (!isLiveCdn(event)) return@mapNotNull null
-                    newLiveSearchResponse("${cdnTitle(event)} [StreamSports]", "https://cdn.domains/$gameId") {
-                        this.posterUrl = cdnPoster(event)
-                    }
-                }
-                if (matchList.isNotEmpty()) {
-                    homePageLists.add(HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", matchList))
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        // StreamFree (streamfree.top) Backup Source
-        try {
-            fetchSFStreams().filter { isLiveSf(it) }.groupBy { it.category ?: "Other" }.forEach { (category, streams) ->
-                val matchList = streams.mapNotNull { stream ->
-                    val key = stream.streamKey ?: return@mapNotNull null
-                    newLiveSearchResponse("${stream.name} [StreamFree]", "https://sf.domains/$key") {
-                        this.posterUrl = stream.thumbnailUrl
-                    }
-                }
-                if (matchList.isNotEmpty()) {
-                    homePageLists.add(HomePageList("${category.replaceFirstChar { it.uppercase() }} [StreamFree]", matchList))
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        return newHomePageResponse(homePageLists)
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        checkAndGetDomain()
-        val results = mutableListOf<SearchResponse>()
-        
-        results.add(
-            newLiveSearchResponse(
-                name = "TRT Yayını",
-                url = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
-            ) {
-                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
-            }
-        )
-
-        // Search Streamed.pk — live only. /matches/all-today also returns not-yet-started
-        // matches, which we deliberately keep out of search results (only /matches/live).
-        val liveMatches = fetchMatches("$apiUrl/matches/live")
-        val allMatches = liveMatches.distinctBy { it.id }
-
-        results.addAll(allMatches.filter { match ->
-            val title = match.title ?: return@filter false
-            matchesSearch(query, title, match.category)
-        }.mapNotNull { match ->
-            val id = match.id ?: return@mapNotNull null
-            val title = match.title ?: return@mapNotNull null
-            newLiveSearchResponse(title, "$mainUrl/match/$id") {
-                this.posterUrl = streamedPoster(match)
-            }
-        })
-
-        // Search PPV Domains (Backup Source)
-        try {
-            val ppvRes = fetchPPVApi()
-            ppvRes?.streams?.forEach { category ->
-                category.streams?.forEach { stream ->
-                    val title = stream.name ?: "Unknown Event"
-
-                    if (matchesSearch(query, title, category.category_name, category.category)) {
-                        val posterUrl = stream.poster?.let {
-                            val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
-                            "$mainUrl/api/images/proxy/$encoded.webp"
-                        }
-                        
-                        if (isLivePpv(category, stream) && (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())) {
-                            results.add(
-                                newLiveSearchResponse(
-                                    name = "$title [PPV]",
-                                    url = "https://ppv.domains/${stream.id}"
-                                ) {
-                                    this.posterUrl = posterUrl
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {}
-
-        // Handle WF Streams search
-        try {
-            val wfMatches = fetchWFMatches()
-            wfMatches?.forEach { match ->
-                val title = match.title ?: "Live Event"
-                if (matchesSearch(query, title, match.sport, match.league) && match.matchId != null && wfHasHd(match) && isLiveWf(match)) {
-                    val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
-                    results.add(
-                        newLiveSearchResponse(
-                            name = "$title [WF]",
-                            url = "https://wf.domains/${match.matchId}"
-                        ) {
-                            this.posterUrl = posterUrl
-                        }
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        // Search StreamSports (cdnlivetv)
-        try {
-            fetchCdnEvents().forEach { (sport, events) ->
-                events.forEach { event ->
-                    val gameId = event.gameID ?: return@forEach
-                    val title = cdnTitle(event)
-                    if (isLiveCdn(event) && matchesSearch(query, title, sport)) {
-                        results.add(
-                            newLiveSearchResponse("$title [StreamSports]", "https://cdn.domains/$gameId") {
-                                this.posterUrl = cdnPoster(event)
-                            }
-                        )
-                    }
-                }
-            }
-        } catch (e: Exception) {}
-
-        // Search StreamFree
-        try {
-            fetchSFStreams().forEach { stream ->
-                val key = stream.streamKey ?: return@forEach
-                val title = stream.name ?: return@forEach
-                if (isLiveSf(stream) && matchesSearch(query, title, stream.category, stream.league)) {
-                    results.add(
-                        newLiveSearchResponse("$title [StreamFree]", "https://sf.domains/$key") {
-                            this.posterUrl = stream.thumbnailUrl
-                        }
-                    )
-                }
-            }
-        } catch (e: Exception) {}
-
-        return results
-    }
+    // --- Load ----------------------------------------------------------------------
 
     override suspend fun load(url: String): LoadResponse? {
         checkAndGetDomain()
-        if (url == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
+        if (url == TRT_URL) {
             return newLiveStreamLoadResponse(
                 name = "TRT Yayını",
                 url = url,
                 dataUrl = url
             ) {
-                this.posterUrl = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
+                this.posterUrl = TRT_POSTER
                 this.plot = "TRT Yayını Live Stream"
             }
         }
@@ -883,28 +881,17 @@ class Cstrsp : MainAPI() {
         // Handle PPV Streams
         if (url.startsWith("https://ppv.domains/")) {
             val streamId = url.substringAfterLast("/").toIntOrNull()
-            
-            val ppvRes = fetchPPVApi()
-            var foundStream: PPVStream? = null
-            ppvRes?.streams?.forEach { category ->
-                val s = category.streams?.find { it.id == streamId }
-                if (s != null) foundStream = s
-            }
-            
-            if (foundStream == null) return null
-            
-            val posterUrl = foundStream?.poster?.let {
-                val encoded = android.util.Base64.encodeToString(it.toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
-                "$mainUrl/api/images/proxy/$encoded.webp"
-            }
-            val title = foundStream?.name ?: "Live Stream"
+            val stream = fetchPPVApi()?.streams
+                ?.firstNotNullOfOrNull { category -> category.streams?.find { it.id == streamId } }
+                ?: return null
+            val title = stream.name ?: "Live Stream"
 
             return newLiveStreamLoadResponse(
                 name = "$title [PPV]",
                 url = url,
-                dataUrl = foundStream!!.toJson()
+                dataUrl = stream.toJson()
             ) {
-                this.posterUrl = posterUrl
+                this.posterUrl = ppvPoster(stream)
                 this.plot = title
             }
         }
@@ -912,11 +899,8 @@ class Cstrsp : MainAPI() {
         // Handle WF Streams
         if (url.startsWith("https://wf.domains/")) {
             val matchId = url.substringAfterLast("/")
-            val wfMatches = fetchWFMatches()
-            val match = wfMatches?.find { it.matchId == matchId } ?: return null
+            val match = fetchWFMatches().find { it.matchId == matchId } ?: return null
             if (!wfHasHd(match)) return null
-
-            val posterUrl = match.poster?.let { "https://api.watchfooty.st$it" }
             val title = match.title ?: "Live Stream"
 
             return newLiveStreamLoadResponse(
@@ -924,7 +908,7 @@ class Cstrsp : MainAPI() {
                 url = url,
                 dataUrl = match.toJson()
             ) {
-                this.posterUrl = posterUrl
+                this.posterUrl = wfPoster(match)
                 this.plot = title
             }
         }
@@ -961,36 +945,33 @@ class Cstrsp : MainAPI() {
 
         // Handle Streamed.pk (Main Source) URL format
         val matchId = url.substringAfterLast("/")
-        var matches = fetchMatches("$apiUrl/matches/live")
-        var match = matches.find { it.id == matchId }
+        var match = fetchMatches("$apiUrl/matches/live").find { it.id == matchId }
         var isLive = true
 
         if (match == null) {
-            matches = fetchMatches("$apiUrl/matches/all-today")
-            match = matches.find { it.id == matchId }
+            match = fetchMatches("$apiUrl/matches/all-today").find { it.id == matchId }
             isLive = false
         }
 
         if (match == null) return null
-
-        val posterUrl = streamedPoster(match)
 
         val sourceNames = match.sources?.mapNotNull { it.source }?.sorted()?.joinToString(", ") { src ->
             src.replaceFirstChar { it.uppercase() }
         } ?: ""
         val sourceLabel = if (sourceNames.isNotEmpty()) " [$sourceNames]" else ""
         val liveLabel = if (!isLive) " [Upcoming]" else ""
-        val displayTitle = "${match.title}$sourceLabel$liveLabel"
 
         return newLiveStreamLoadResponse(
-            name = displayTitle,
+            name = "${match.title}$sourceLabel$liveLabel",
             url = url,
             dataUrl = (match.sources ?: emptyList<APISource>()).toJson()
         ) {
-            this.posterUrl = posterUrl
+            this.posterUrl = streamedPoster(match)
             this.plot = if (isLive) "Live stream for ${match.title}" else "Upcoming: ${match.title}"
         }
     }
+
+    // --- Links ----------------------------------------------------------------------
 
     override suspend fun loadLinks(
         data: String,
@@ -999,7 +980,7 @@ class Cstrsp : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         checkAndGetDomain()
-        if (data == "https://tv-trt1.medya.trt.com.tr/master.m3u8") {
+        if (data == TRT_URL) {
             callback.invoke(
                 ExtractorLink(
                     source = "TRT",
@@ -1020,16 +1001,15 @@ class Cstrsp : MainAPI() {
                 val iframes = mutableListOf<Pair<String, String>>()
                 val mainIframe = stream.iframe ?: stream.uri_name?.let { "https://embedindia.st/embed/$it" }
                 if (mainIframe != null) {
-                    iframes.add(Pair("Main", mainIframe))
+                    iframes.add("Main" to mainIframe)
                 }
                 stream.substreams?.forEach { sub ->
                     val subIframe = sub.iframe ?: sub.uri_name?.let { "https://embedindia.st/embed/$it" }
                     if (subIframe != null) {
-                        val name = sub.source_tag ?: sub.name ?: sub.locale ?: "Substream"
-                        iframes.add(Pair(name, subIframe))
+                        iframes.add((sub.source_tag ?: sub.name ?: sub.locale ?: "Substream") to subIframe)
                     }
                 }
-                
+
                 iframes.resolveConcurrently { (name, iframeUrl) ->
                     loadExtractor(iframeUrl, "https://embedindia.st/", subtitleCallback) { link ->
                         callback(
@@ -1163,38 +1143,46 @@ class Cstrsp : MainAPI() {
             return false
         }
 
-        if (sources != null) {
-            sources.resolveConcurrently { source ->
-                // HD only (drop SD streams).
-                val streams = app.get("$apiUrl/stream/${source.source}/${source.id}")
-                    .parsedSafe<Array<APIStream>>()?.toList()?.filter { it.hd } ?: emptyList()
-
-                streams.resolveConcurrently { stream ->
-                    val langStr = stream.language ?: "Unknown"
-                    val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
-                    val base = "$sourceName - $langStr - Stream ${stream.streamNo}"
-                    val embedUrl = stream.embedUrl
-                    // Pass the embed URL to our WebView extractor (or built-in extractors)
-                    loadExtractor(embedUrl, "$mainUrl/", subtitleCallback) { link ->
-                        // Trust the extractor's detected resolution (from the master playlist).
-                        // When it can't be determined we leave it Unknown rather than guessing
-                        // 720p, so we never label a stream with a resolution we didn't measure.
-                        val quality = link.quality
-                        val labeled = withQualityLabel(base, quality)
-                        callback.invoke(
-                            ExtractorLink(
-                                source = labeled,
-                                name = labeled,
-                                url = link.url,
-                                referer = link.referer,
-                                quality = quality,
-                                type = link.type,
-                                headers = link.headers,
-                                extractorData = link.extractorData
-                            )
-                        )
+        // Fetch every source's stream list first (cheap JSON calls, all in parallel), then
+        // resolve the flattened embed list through ONE bounded pool. The old nested
+        // resolveConcurrently could stack up to 4x4 concurrent WebViews.
+        val embeds = coroutineScope {
+            sources.map { source ->
+                async {
+                    try {
+                        app.get("$apiUrl/stream/${source.source}/${source.id}")
+                            .parsedSafe<Array<APIStream>>()
+                            ?.filter { it.hd } // HD only (drop SD streams).
+                            ?.map { source to it } ?: emptyList()
+                    } catch (e: Exception) {
+                        emptyList()
                     }
                 }
+            }.awaitAll().flatten()
+        }
+
+        embeds.resolveConcurrently { (source, stream) ->
+            val langStr = stream.language ?: "Unknown"
+            val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
+            val base = "$sourceName - $langStr - Stream ${stream.streamNo}"
+            // Pass the embed URL to our WebView extractor (or built-in extractors)
+            loadExtractor(stream.embedUrl, "$mainUrl/", subtitleCallback) { link ->
+                // Trust the extractor's detected resolution (from the master playlist).
+                // When it can't be determined we leave it Unknown rather than guessing
+                // 720p, so we never label a stream with a resolution we didn't measure.
+                val labeled = withQualityLabel(base, link.quality)
+                callback.invoke(
+                    ExtractorLink(
+                        source = labeled,
+                        name = labeled,
+                        url = link.url,
+                        referer = link.referer,
+                        quality = link.quality,
+                        type = link.type,
+                        headers = link.headers,
+                        extractorData = link.extractorData
+                    )
+                )
             }
         }
 

@@ -98,6 +98,14 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         }
 
                         @Suppress("NAME_SHADOWING") val reqUrl = request?.url.toString()
+                        val isPlaylistUrl = reqUrl.contains(".m3u")
+                        // Cheap URL pre-filter: static assets and media segments can never
+                        // be a playlist, so don't spawn a probe thread for them — these
+                        // ad-heavy embed pages fire hundreds of such requests.
+                        if (!isPlaylistUrl && isStaticAsset(reqUrl)) {
+                            return super.shouldInterceptRequest(view, request)
+                        }
+
                         val headers = request?.requestHeaders?.toMutableMap() ?: mutableMapOf()
                         // Issue order of the request, not completion order of the probe:
                         // this is what lets an earlier master beat a faster variant.
@@ -115,14 +123,24 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                             headers["User-Agent"] = cachedUserAgent ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                         }
 
-                        Thread {
-                            fetchAndCheckResponse(reqUrl, headers) { sourceUrl, outHeaders, isMaster, maxHeight ->
-                                if (!selectionDone.get()) {
-                                    candidates.add(Candidate(seq, sourceUrl, outHeaders, isMaster, maxHeight))
-                                    firstCaptureAt.compareAndSet(0L, System.currentTimeMillis())
+                        if (isPlaylistUrl) {
+                            // Captured blind, without fetching the body: probing could consume
+                            // a one-time playback token and break the URL for ExoPlayer.
+                            // "master" in the URL is a safe hint; anything else stays unknown.
+                            // No network involved, so no thread needed either.
+                            val isMaster = if (reqUrl.contains("master", ignoreCase = true)) true else null
+                            candidates.add(Candidate(seq, reqUrl, headers, isMaster, null))
+                            firstCaptureAt.compareAndSet(0L, System.currentTimeMillis())
+                        } else {
+                            Thread {
+                                probePlaylist(reqUrl, headers) { sourceUrl, outHeaders, isMaster, maxHeight ->
+                                    if (!selectionDone.get()) {
+                                        candidates.add(Candidate(seq, sourceUrl, outHeaders, isMaster, maxHeight))
+                                        firstCaptureAt.compareAndSet(0L, System.currentTimeMillis())
+                                    }
                                 }
-                            }
-                        }.start()
+                            }.start()
+                        }
 
                         return super.shouldInterceptRequest(view, request)
                     }
@@ -179,21 +197,9 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
         }
     }
 
-    private fun fetchAndCheckResponse(url: String, headers: Map<String, String>?, onResponseCaptured: (url: String, headers: Map<String, String>, isMaster: Boolean?, maxHeight: Int?) -> Unit) {
-        if (url.contains(".m3u")) {
-            // Captured blind, without fetching the body: probing could consume a
-            // one-time playback token and break the URL for ExoPlayer. "master" in the
-            // URL is a safe hint; anything else stays unknown.
-            val isMaster = if (url.contains("master", ignoreCase = true)) true else null
-            onResponseCaptured(url, headers ?: mapOf(), isMaster, null)
-            return
-        }
-
-        // Skip obvious static assets and API endpoints that use GET
-        if (url.endsWith(".js") || url.endsWith(".css") || url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".webp") || url.endsWith(".svg") || url.endsWith(".gif") || url.endsWith(".woff") || url.endsWith(".woff2") || url.endsWith(".ts") || url.endsWith("/fetch")) {
-            return
-        }
-
+    // Probes a URL that *might* be a playlist served without ".m3u" in its path: fetches
+    // the head of the body and captures it only when it turns out to be an HLS playlist.
+    private fun probePlaylist(url: String, headers: Map<String, String>?, onResponseCaptured: (url: String, headers: Map<String, String>, isMaster: Boolean?, maxHeight: Int?) -> Unit) {
         try {
             val connection = URL(url).openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
@@ -248,6 +254,19 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
     companion object {
         private const val GRACE_MS = 2000L
         private val RESOLUTION_REGEX = Regex("""RESOLUTION=\d+x(\d+)""")
+        // Extensions that can never be an HLS playlist. ".ts"/".m4s"/".mp4" are media
+        // segments; playlist URLs are caught earlier by the ".m3u" check.
+        private val SKIP_EXTENSIONS = arrayOf(
+            ".js", ".css", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".ico",
+            ".woff", ".woff2", ".ttf", ".otf", ".ts", ".m4s", ".mp4", ".webm",
+            ".mp3", ".aac", ".wasm", ".map"
+        )
+
+        // Checked against the path only, so query strings ("logo.png?v=2") can't dodge it.
+        private fun isStaticAsset(url: String): Boolean {
+            val path = url.substringBefore('?').substringBefore('#')
+            return path.endsWith("/fetch") || SKIP_EXTENSIONS.any { path.endsWith(it, ignoreCase = true) }
+        }
 
         fun heightToQuality(h: Int?): Int = when {
             h == null -> Qualities.Unknown.value
