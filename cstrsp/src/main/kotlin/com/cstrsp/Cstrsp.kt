@@ -18,10 +18,13 @@ import kotlinx.coroutines.sync.withPermit
 
 private const val CACHE_TTL_MS = 30_000L
 // Hard caps so a slow/dead upstream can never stall CloudStream's app-wide search or home,
-// which only render after EVERY provider returns (see search()/getMainPage()).
-private const val SEARCH_BUDGET_MS = 10_000L
-private const val HOME_BUDGET_MS = 12_000L
+// which only render after EVERY provider returns (see search()/getMainPage()). FETCH_TIMEOUT_S
+// bounds each individual upstream call — critical because dead hosts (e.g. api.ppv.to) otherwise
+// hang ~12s+ and, probed first & sequentially, would block the whole merged search grid.
+private const val SEARCH_BUDGET_MS = 8_000L
+private const val HOME_BUDGET_MS = 10_000L
 private const val DOMAIN_PROBE_TIMEOUT_S = 4L
+private const val FETCH_TIMEOUT_S = 5L
 private const val TRT_URL = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
 private const val TRT_POSTER =
     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
@@ -257,7 +260,8 @@ class Cstrsp : MainAPI() {
     private suspend fun fetchPPVApi(): PPVResponse? = cached("ppv") {
         ppvDomains.firstNotNullOfOrNull { domain ->
             try {
-                app.get("https://$domain/api/streams").parsedSafe<PPVResponse>()?.takeIf { it.streams != null }
+                app.get("https://$domain/api/streams", timeout = FETCH_TIMEOUT_S)
+                    .parsedSafe<PPVResponse>()?.takeIf { it.streams != null }
             } catch (e: Exception) {
                 null
             }
@@ -265,13 +269,14 @@ class Cstrsp : MainAPI() {
     }
 
     private suspend fun fetchWFMatches(): List<WFMatch> = cached("wf") {
-        app.get("https://api.watchfooty.st/api/v1/matches/all").parsedSafe<Array<WFMatch>>()?.toList()
+        app.get("https://api.watchfooty.st/api/v1/matches/all", timeout = FETCH_TIMEOUT_S)
+            .parsedSafe<Array<WFMatch>>()?.toList()
     } ?: emptyList()
 
     // Returns sport -> events, keeping only events that currently have a playable channel.
     private suspend fun fetchCdnEvents(): Map<String, List<CdnEvent>> = cached("cdn") {
-        val res = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free").parsedSafe<CdnResponse>()
-            ?: return@cached null
+        val res = app.get("$cdnApiUrl/events/sports/?user=cdnlivetv&plan=free", timeout = FETCH_TIMEOUT_S)
+            .parsedSafe<CdnResponse>() ?: return@cached null
         val out = LinkedHashMap<String, List<CdnEvent>>()
         res.data?.forEach { (sport, value) ->
             val raw = value as? List<*> ?: return@forEach // skip scalar metadata keys
@@ -288,13 +293,14 @@ class Cstrsp : MainAPI() {
     } ?: emptyMap()
 
     private suspend fun fetchSFStreams(): List<SFStream> = cached("sf") {
-        app.get("$streamfreeUrl/api/v1/streams").parsedSafe<SFResponse>()?.streams
+        app.get("$streamfreeUrl/api/v1/streams", timeout = FETCH_TIMEOUT_S).parsedSafe<SFResponse>()?.streams
             ?.filter { it.name != null && it.embedUrl != null && it.streamKey != null }
     } ?: emptyList()
 
     // Helper to fetch matches from streamed.pk
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> = cached(endpoint) {
-        app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList()?.filter { it.id != null && it.title != null }
+        app.get(endpoint, timeout = FETCH_TIMEOUT_S).parsedSafe<Array<APIMatch>>()?.toList()
+            ?.filter { it.id != null && it.title != null }
     } ?: emptyList()
 
     private fun sfQuality(q: String): Int = when (q) {
