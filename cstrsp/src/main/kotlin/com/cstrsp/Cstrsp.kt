@@ -804,11 +804,17 @@ class Cstrsp : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
 
-        results.add(
-            newLiveSearchResponse(name = "TRT Yayını", url = TRT_URL) {
-                this.posterUrl = TRT_POSTER
-            }
-        )
+        // TRT'yi YALNIZCA ilgili sorgularda ekle. Önceden her aramada eklendiğinden, alakasız
+        // sorgularda (ör. "naruto") cstrsp tek kartı (TRT) ile hep bir sonuç döndürüyordu;
+        // artık eşleşme yoksa cstrsp boş döner ve kendi bölümü aramada hiç görünmez.
+        val q = query.lowercase().trim()
+        if ("trt" in q || "türk" in q || "turk" in q) {
+            results.add(
+                newLiveSearchResponse(name = "TRT Yayını", url = TRT_URL) {
+                    this.posterUrl = TRT_POSTER
+                }
+            )
+        }
 
         // CloudStream runs every provider's search in parallel but only renders the merged
         // results once the SLOWEST one returns. Our sport APIs (esp. the sequential PPV domain
