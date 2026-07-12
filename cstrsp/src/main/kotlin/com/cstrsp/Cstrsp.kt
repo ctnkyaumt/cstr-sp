@@ -802,41 +802,19 @@ class Cstrsp : MainAPI() {
     // --- Search ----------------------------------------------------------------------
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-
-        // TRT'yi YALNIZCA ilgili sorgularda ekle. Önceden her aramada eklendiğinden, alakasız
-        // sorgularda (ör. "naruto") cstrsp tek kartı (TRT) ile hep bir sonuç döndürüyordu;
-        // artık eşleşme yoksa cstrsp boş döner ve kendi bölümü aramada hiç görünmez.
+        // ==== DIAGNOSTIC v6: instant, ZERO-network search ====
+        // Isolates whether cstrsp's search EXECUTION (its sport-API network) is what breaks
+        // co-installed providers' search, vs. cstrsp's mere presence (extractors/registration).
+        // If Cs-Karma results show with this build, the sport fan-out is the culprit and gets
+        // made truly non-blocking; if not, the cause is registration and I strip that next.
+        // The real fan-out (searchStreamed/Ppv/Wf/Cdn/Sf) is restored after diagnosis.
+        android.util.Log.d("cstrsp_diag", "search('$query') v6 instant/no-network")
         val q = query.lowercase().trim()
-        if ("trt" in q || "türk" in q || "turk" in q) {
-            results.add(
-                newLiveSearchResponse(name = "TRT Yayını", url = TRT_URL) {
-                    this.posterUrl = TRT_POSTER
-                }
-            )
+        return if ("trt" in q || "türk" in q || "turk" in q) {
+            listOf(newLiveSearchResponse(name = "TRT Yayını", url = TRT_URL) { this.posterUrl = TRT_POSTER })
+        } else {
+            emptyList()
         }
-
-        // CloudStream runs every provider's search in parallel but only renders the merged
-        // results once the SLOWEST one returns. Our sport APIs (esp. the sequential PPV domain
-        // probe) can take tens of seconds on a dead host, which would stall the ENTIRE app-wide
-        // search and hide other providers. Bound the whole fan-out so we always return promptly;
-        // TRT is added above the budget so it's returned even if the sport lookups time out.
-        withTimeoutOrNull(SEARCH_BUDGET_MS) {
-            checkAndGetDomain()
-            val matcher = QueryMatcher(query)
-            // Same concurrency + ordering rationale as getMainPage.
-            coroutineScope {
-                listOf(
-                    async { safeList { searchStreamed(matcher) } },
-                    async { safeList { searchPpv(matcher) } },
-                    async { safeList { searchWf(matcher) } },
-                    async { safeList { searchCdn(matcher) } },
-                    async { safeList { searchSf(matcher) } }
-                ).awaitAll()
-            }.forEach { results.addAll(it) }
-        }
-
-        return results
     }
 
     // Streamed.pk — live only. /matches/all-today also returns not-yet-started matches,
