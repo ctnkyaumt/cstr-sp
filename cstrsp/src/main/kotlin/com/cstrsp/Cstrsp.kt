@@ -10,12 +10,18 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 
 private const val CACHE_TTL_MS = 30_000L
+// Hard caps so a slow/dead upstream can never stall CloudStream's app-wide search or home,
+// which only render after EVERY provider returns (see search()/getMainPage()).
+private const val SEARCH_BUDGET_MS = 10_000L
+private const val HOME_BUDGET_MS = 12_000L
+private const val DOMAIN_PROBE_TIMEOUT_S = 4L
 private const val TRT_URL = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
 private const val TRT_POSTER =
     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
@@ -61,7 +67,7 @@ class Cstrsp : MainAPI() {
         if (isDomainChecked) return
         for (domain in domains) {
             try {
-                val response = app.get("$domain/api/matches/live")
+                val response = app.get("$domain/api/matches/live", timeout = DOMAIN_PROBE_TIMEOUT_S)
                 if (response.code in 200..299) {
                     mainUrl = domain
                     apiUrl = "$domain/api"
@@ -721,19 +727,22 @@ class Cstrsp : MainAPI() {
     // --- Home ----------------------------------------------------------------------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        checkAndGetDomain()
         // All five upstreams fetched concurrently — one slow or dead source no longer
         // delays the whole home page. awaitAll preserves order, so sections stay stable:
-        // Streamed, PPV, WF, StreamSports, StreamFree.
-        val sections = coroutineScope {
-            listOf(
-                async { safeList { streamedHomeSections() } },
-                async { safeList { ppvHomeSections() } },
-                async { safeList { wfHomeSections() } },
-                async { safeList { cdnHomeSections() } },
-                async { safeList { sfHomeSections() } }
-            ).awaitAll()
-        }.flatten()
+        // Streamed, PPV, WF, StreamSports, StreamFree. Bounded overall so a hung upstream
+        // can't stall CloudStream's home (which, like search, waits on every provider).
+        val sections = withTimeoutOrNull(HOME_BUDGET_MS) {
+            checkAndGetDomain()
+            coroutineScope {
+                listOf(
+                    async { safeList { streamedHomeSections() } },
+                    async { safeList { ppvHomeSections() } },
+                    async { safeList { wfHomeSections() } },
+                    async { safeList { cdnHomeSections() } },
+                    async { safeList { sfHomeSections() } }
+                ).awaitAll()
+            }.flatten()
+        } ?: emptyList()
         return newHomePageResponse(sections)
     }
 
@@ -787,8 +796,6 @@ class Cstrsp : MainAPI() {
     // --- Search ----------------------------------------------------------------------
 
     override suspend fun search(query: String): List<SearchResponse> {
-        checkAndGetDomain()
-        val matcher = QueryMatcher(query)
         val results = mutableListOf<SearchResponse>()
 
         results.add(
@@ -797,16 +804,25 @@ class Cstrsp : MainAPI() {
             }
         )
 
-        // Same concurrency + ordering rationale as getMainPage.
-        coroutineScope {
-            listOf(
-                async { safeList { searchStreamed(matcher) } },
-                async { safeList { searchPpv(matcher) } },
-                async { safeList { searchWf(matcher) } },
-                async { safeList { searchCdn(matcher) } },
-                async { safeList { searchSf(matcher) } }
-            ).awaitAll()
-        }.forEach { results.addAll(it) }
+        // CloudStream runs every provider's search in parallel but only renders the merged
+        // results once the SLOWEST one returns. Our sport APIs (esp. the sequential PPV domain
+        // probe) can take tens of seconds on a dead host, which would stall the ENTIRE app-wide
+        // search and hide other providers. Bound the whole fan-out so we always return promptly;
+        // TRT is added above the budget so it's returned even if the sport lookups time out.
+        withTimeoutOrNull(SEARCH_BUDGET_MS) {
+            checkAndGetDomain()
+            val matcher = QueryMatcher(query)
+            // Same concurrency + ordering rationale as getMainPage.
+            coroutineScope {
+                listOf(
+                    async { safeList { searchStreamed(matcher) } },
+                    async { safeList { searchPpv(matcher) } },
+                    async { safeList { searchWf(matcher) } },
+                    async { safeList { searchCdn(matcher) } },
+                    async { safeList { searchSf(matcher) } }
+                ).awaitAll()
+            }.forEach { results.addAll(it) }
+        }
 
         return results
     }
