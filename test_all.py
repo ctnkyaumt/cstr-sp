@@ -60,21 +60,35 @@ def test_ppv():
             iframe_part = s.get('iframe')[:60] if s.get('iframe') else 'None'
             print(f"  * Stream: {s.get('name')} | iframe: {iframe_part}...")
 
-def test_ntv():
+def get_text(url, referer=None):
+    req_headers = headers.copy()
+    if referer:
+        req_headers['Referer'] = referer
+    req = urllib.request.Request(url, headers=req_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.read().decode('utf-8', errors='ignore')
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+
+def test_roxie():
     print("\n========================================")
-    print("--- TESTING NTV (ntv.cx) ---")
-    # kobra == streamed.pk mirror, skipped in the plugin
-    for server in ["raptor", "falcon", "phoenix", "viper"]:
-        res = get_json(f"https://ntv.cx/api/get-matches?server={server}&type=both", referer="https://ntv.cx/")
-        if not res or not res.get("success"):
-            print(f"- {server}: failed")
-            continue
-        live = res.get("live", [])
-        allm = res.get("all", [])
-        print(f"- {server}: {len(allm)} matches, {len(live)} live")
-        for m in (live or allm)[:2]:
-            title = m.get("title", "").encode("ascii", "replace").decode()
-            print(f"    * {title} [{m.get('category')}] sources={len(m.get('sources') or [])}")
+    print("--- TESTING ROXIE (roxiestreams.su) ---")
+    base = "https://roxiestreams.su"
+    home = get_text(base + "/", referer=base + "/")
+    if not home:
+        print("Failed to fetch Roxie homepage.")
+        return
+    table = home.split('id="eventsTable"', 1)[-1].split("</table>", 1)[0]
+    rows = re.findall(r'href="(/[^"]+)"[^>]*>([^<]+)</a>', table)
+    print(f"Found {len(rows)} events.")
+    for path, name in rows[:4]:
+        page = get_text(base + path, referer=base + "/") or ""
+        btns = re.findall(r'<button[^>]*onclick="([^"]*)"[^>]*>(.*?)</button>', page, re.S)
+        m3u8 = sum(1 for h, _ in btns if "getRandomStream" in h)
+        raw = sum(1 for h, _ in btns if "playIframePlayer" in h)
+        print(f"- {name.strip()} ({path}): {m3u8} m3u8 + {raw} raw sources")
 
 def test_streamed():
     print("\n========================================")
@@ -94,4 +108,4 @@ if __name__ == "__main__":
     test_wf()
     test_ppv()
     test_streamed()
-    test_ntv()
+    test_roxie()

@@ -14,6 +14,6 @@ class CstrspPlugin: Plugin() {
         registerExtractorAPI(CstrspExtractor("https://cdnlivetv.tv/", context))
         registerExtractorAPI(CstrspExtractor("https://embedindia.st/", context))
         registerExtractorAPI(CstrspExtractor("https://sportsembed.su/", context))
-        registerExtractorAPI(CstrspExtractor("https://ntv.cx/", context))
+        registerExtractorAPI(CstrspExtractor("https://roxiestreams.su/", context))
     }
 }

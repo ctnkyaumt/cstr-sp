@@ -16,13 +16,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 
 private const val CACHE_TTL_MS = 30_000L
-// How long after kick-off an ntv event is still treated as live. ntv publishes a start time
-// but no end time, so this is the window that stands in for one; 3h covers a football match
-// plus stoppage/overrun without dragging finished events through the rest of the evening.
-private const val NTV_EVENT_WINDOW_MS = 3 * 60 * 60 * 1000L
-// Feeds resolved per fixture. Each costs a /watch fetch plus a WebView extractor, and a
-// fixture can list 60+ across servers.
-private const val NTV_MAX_SOURCES = 8
 private const val TRT_URL = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
 private const val TRT_POSTER =
     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
@@ -37,11 +30,11 @@ class Cstrsp : MainAPI() {
 
     private var apiUrl = "https://streamed.pk/api"
     private val cdnApiUrl = "https://api.cdnlivetv.tv/api/v1"
-    private val ntvUrl = "https://ntv.cx"
-    // ntv.cx aggregates several upstreams behind named "servers". "kobra" is a verbatim
-    // streamed.pk mirror (same ids, 100% overlap) — skip it so we don't double-list what the
-    // Streamed source already provides. The rest carry distinct events via ntv's own CDN.
-    private val ntvServers = listOf("raptor", "falcon", "phoenix", "viper")
+    private val roxieUrl = "https://roxiestreams.su"
+    // Last roxie CDN host that served a valid playlist. The site rotates m3u8 across a pool
+    // of domains (domainsz56.txt) and only some answer at any moment (the rest are
+    // Cloudflare-blocked), so we remember a working one and try it first next time.
+    @Volatile private var roxieGoodDomain: String? = null
     private var isDomainChecked = false
     private val domains = listOf("https://streamed.pk", "https://streamed.st")
 
@@ -218,46 +211,30 @@ class Cstrsp : MainAPI() {
         @JsonProperty("cdn-live-tv") val data: Map<String, Any?>? = null
     )
 
-    // ntv.cx — /api/get-matches?server=<id>&type=both. Schema mirrors streamed.pk's match
-    // shape, but teams/poster are never populated for the non-mirror servers, so we key off
-    // title + category + sources only. `sources[i].source` is a channel tag we reuse as the
-    // per-source label; the playable token isn't here — it's minted per source index by the
-    // /watch page (see loadLinks).
-    data class NtvMatch(
-        @JsonProperty("id") val id: String? = null,
-        @JsonProperty("title") val title: String? = null,
-        @JsonProperty("category") val category: String? = null,
-        // Unix ms of kick-off. Present on every entry, and the only liveness signal most
-        // ntv servers give us (see isLiveNtv).
-        @JsonProperty("date") val date: Long? = null,
-        @JsonProperty("popular") val popular: Boolean = false,
-        // Nullable on purpose: only the live-capable servers emit this key at all. `false`
-        // from a schedule-only server means "unknown", not "not live", so it must not be
-        // read as an authoritative negative.
-        @JsonProperty("live") val live: Boolean? = null,
-        @JsonProperty("sources") val sources: List<APISource>? = null
+    // roxiestreams.su has no API — it's server-rendered HTML. An event is a row in the
+    // homepage "Upcoming Events" table; `path` is the relative link to its stream page.
+    data class RoxieEvent(
+        @JsonProperty("name") val name: String,
+        @JsonProperty("path") val path: String
     )
 
-    data class NtvResponse(
-        @JsonProperty("live") val live: List<NtvMatch>? = null,
-        @JsonProperty("nonLive") val nonLive: List<NtvMatch>? = null,
-        @JsonProperty("all") val all: List<NtvMatch>? = null
+    // One playable button on an event page. Two kinds:
+    //  - "m3u8": a getRandomStream(streamPath, subdomain) call → a direct playlist at
+    //    https://<subdomain>.<rotating-domain>/<streamPath>.
+    //  - "raw":  a playIframePlayer('/raw/x') call → an embed page we WebView-sniff.
+    data class RoxieSource(
+        @JsonProperty("label") val label: String,
+        @JsonProperty("kind") val kind: String,
+        @JsonProperty("value") val value: String,
+        @JsonProperty("subdomain") val subdomain: String = ""
     )
 
-    // One playable feed: which server+match to mint a token from, the source index on that
-    // match's /watch page, and the channel tag to label it with.
-    data class NtvSourceRef(
-        @JsonProperty("server") val server: String,
-        @JsonProperty("id") val id: String,
-        @JsonProperty("index") val index: Int,
-        @JsonProperty("label") val label: String
-    )
-
-    // Carried in dataUrl from load() to loadLinks(). One fixture's feeds, merged across
-    // every server that carries it, so a single card opens a sources menu with all of them.
-    data class NtvLoadData(
-        @JsonProperty("ntvTitle") val ntvTitle: String,
-        @JsonProperty("refs") val refs: List<NtvSourceRef>
+    // Carried in dataUrl from load() to loadLinks(): the event page path plus its scraped
+    // buttons, so loadLinks resolves them without re-fetching the page.
+    data class RoxieLoadData(
+        @JsonProperty("name") val name: String,
+        @JsonProperty("path") val path: String,
+        @JsonProperty("sources") val sources: List<RoxieSource>
     )
 
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
@@ -300,95 +277,78 @@ class Cstrsp : MainAPI() {
         app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList()?.filter { it.id != null && it.title != null }
     } ?: emptyList()
 
-    // ntv category markers for non-sport feeds (24-7 TV channels, reality-show cameras).
-    // We surface events only, so anything whose category matches one of these is dropped.
-    private val ntvNonEventMarkers = listOf(
-        "tv show", "big brother", "live camera", "camera feed", "live feed", "24 7", "channel"
-    )
+    // An event row in the homepage table: <td><a href="/path">Name</a></td>. Scoped to the
+    // events table (see fetchRoxieEvents) so it never picks up the nav's category links.
+    private val roxieEventRowRegex = Regex("href=\"(/[^\"]+)\"[^>]*>([^<]+)</a>")
+    // A player button and its onclick handler.
+    private val roxieButtonRegex = Regex("<button[^>]*onclick=\"([^\"]*)\"[^>]*>(.*?)</button>", RegexOption.DOT_MATCHES_ALL)
+    // getRandomStream('tsn.m3u8', 'admin2') — second arg optional (JS default 'ataide0').
+    private val roxieGetStreamRegex = Regex("getRandomStream\\(\\s*'([^']+)'(?:\\s*,\\s*'([^']+)')?\\s*\\)")
+    // playIframePlayer('/raw/ctv')
+    private val roxieRawRegex = Regex("playIframePlayer\\(\\s*'([^']+)'\\s*\\)")
+    private val roxieTagRegex = Regex("<[^>]+>")
 
-    private fun isNtvEvent(category: String?): Boolean {
-        val c = normalizeText(category ?: return true)
-        return ntvNonEventMarkers.none { c.contains(it) }
-    }
-
-    // The /watch page mints a fresh, opaque embed token per source index; we pull it out of
-    // the player iframe's src (`/embed?t=<token>`). Tokens end in a URL-safe '~' (a '=' the
-    // site swapped), so the class includes it — it must be passed to /embed verbatim.
-    private val ntvEmbedRegex = Regex("/embed\\?t=([A-Za-z0-9._~=+/-]+)")
-
-    // Fetches the embed url for one source index of an ntv match. Each source is a separate
-    // /watch fetch because the token is per (match, source) — there's no batch endpoint.
-    private suspend fun ntvSourceEmbed(server: String, id: String, index: Int): String? {
-        return try {
-            val html = app.get("$ntvUrl/watch/$server/$id?source=$index", referer = "$ntvUrl/").text
-            ntvEmbedRegex.find(html)?.groupValues?.get(1)?.let { "$ntvUrl/embed?t=$it" }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    // One server's playable events, minus non-sport feeds. Cached per server so home +
-    // search + load share a single round-trip.
-    //
-    // Deliberately reads `all`, not the response's `live` array: only the live-capable
-    // servers populate that array (the streamed.pk mirror we skip), while the servers we
-    // actually use are schedule-only — their `live` array is always empty and most don't
-    // even emit a per-match `live` key. Filtering on it surfaced nothing, ever. Liveness is
-    // decided by isLiveNtv instead.
-    private suspend fun fetchNtv(server: String): List<NtvMatch> = cached("ntv-$server") {
-        app.get("$ntvUrl/api/get-matches?server=$server&type=both").parsedSafe<NtvResponse>()?.all
-            ?.filter { it.id != null && it.title != null && !it.sources.isNullOrEmpty() && isNtvEvent(it.category) }
+    // The homepage "Upcoming Events" table, one card per row. Cached; shared by home/search/load.
+    private suspend fun fetchRoxieEvents(): List<RoxieEvent> = cached("roxie-events") {
+        val html = app.get("$roxieUrl/", referer = "$roxieUrl/").text
+        val table = html.substringAfter("id=\"eventsTable\"", "").substringBefore("</table>", "")
+        if (table.isBlank()) return@cached null
+        roxieEventRowRegex.findAll(table)
+            .map { RoxieEvent(it.groupValues[2].trim(), it.groupValues[1].trim()) }
+            .filter { it.name.isNotBlank() && it.path.isNotBlank() }
+            .distinctBy { it.path }
+            .toList()
+            .takeIf { it.isNotEmpty() }
     } ?: emptyList()
 
-    // ntv gives a kick-off time but never an end time, so "live" is a window: started, and
-    // not older than NTV_EVENT_WINDOW_MS. An explicit live=true (live-capable servers only)
-    // short-circuits it; live=false is treated as unknown, since schedule-only servers emit
-    // it for matches that are in fact playable.
-    private fun isLiveNtv(match: NtvMatch): Boolean {
-        if (match.live == true) return true
-        val start = match.date ?: return false
-        val now = System.currentTimeMillis()
-        return start <= now && now - start <= NTV_EVENT_WINDOW_MS
-    }
+    // The CDN host pool for direct m3u8 playback (newline-separated, with duplicates).
+    private suspend fun fetchRoxieDomains(): List<String> = cached("roxie-domains") {
+        app.get("$roxieUrl/domainsz56.txt", referer = "$roxieUrl/").text
+            .lines().map { it.trim() }.filter { it.isNotBlank() }.distinct()
+            .takeIf { it.isNotEmpty() }
+    } ?: emptyList()
 
-    // A fixture can be carried by several ntv servers at once (each a different upstream).
-    // Group them under one title so home/search show a single card whose sources menu holds
-    // every server's feeds — mirroring how Streamed/WF list one card per match.
-    private suspend fun ntvLiveByTitle(): Map<String, List<Pair<String, NtvMatch>>> = coroutineScope {
-        ntvServers.map { server -> async { server to safeList { fetchNtv(server) } } }.awaitAll()
-            .flatMap { (server, matches) -> matches.filter { isLiveNtv(it) }.map { server to it } }
-            .groupBy { (_, m) -> m.title!! }
-    }
-
-    // Round-robins across servers so a capped list keeps feeds from every server that has
-    // the fixture, instead of spending the whole budget on whichever one listed most.
-    private fun ntvRefs(entries: List<Pair<String, NtvMatch>>): List<NtvSourceRef> {
-        val perServer = entries.map { (server, m) ->
-            m.sources.orEmpty().mapIndexedNotNull { i, s ->
-                val id = m.id ?: return@mapIndexedNotNull null
-                NtvSourceRef(server, id, i, s.source?.takeIf { it.isNotBlank() } ?: "Source ${i + 1}")
+    // Scrapes one event page's player buttons into resolvable sources.
+    private suspend fun fetchRoxieSources(path: String): List<RoxieSource> = cached("roxie-src-$path") {
+        val html = app.get("$roxieUrl$path", referer = "$roxieUrl/").text
+        roxieButtonRegex.findAll(html).mapNotNull { m ->
+            val onclick = m.groupValues[1]
+            val label = roxieTagRegex.replace(m.groupValues[2], "").trim().ifBlank { "Stream" }
+            roxieGetStreamRegex.find(onclick)?.let {
+                return@mapNotNull RoxieSource(label, "m3u8", it.groupValues[1], it.groupValues[2].ifBlank { "ataide0" })
             }
-        }
-        val out = mutableListOf<NtvSourceRef>()
-        var i = 0
-        while (out.size < NTV_MAX_SOURCES && perServer.any { i < it.size }) {
-            for (list in perServer) {
-                if (out.size >= NTV_MAX_SOURCES) break
-                list.getOrNull(i)?.let { out.add(it) }
+            roxieRawRegex.find(onclick)?.let {
+                return@mapNotNull RoxieSource(label, "raw", it.groupValues[1])
             }
-            i++
+            null
+        }.toList().takeIf { it.isNotEmpty() }
+    } ?: emptyList()
+
+    // Resolves an m3u8 source to a playable playlist url, or null. Tries the last-known-good
+    // domain first, then the rest, accepting the first that returns a real HLS playlist —
+    // Cloudflare-blocked domains answer 403 HTML, so a status/body check is required.
+    private suspend fun resolveRoxieM3u8(source: RoxieSource, domains: List<String>): String? {
+        for (domain in (listOfNotNull(roxieGoodDomain) + domains).distinct()) {
+            val url = "https://${source.subdomain}.$domain/${source.value}"
+            try {
+                val res = app.get(url, referer = "$roxieUrl/", headers = mapOf("Origin" to roxieUrl))
+                if (res.code == 200 && res.text.trimStart().startsWith("#EXTM")) {
+                    roxieGoodDomain = domain
+                    return url
+                }
+            } catch (e: Exception) {}
         }
-        return out
+        return null
     }
 
-    // Titles carry spaces/emoji/punctuation, so key the card url by a url-safe encoding of
-    // the title rather than the raw text.
-    private fun ntvKey(title: String): String = android.util.Base64.encodeToString(
-        title.toByteArray(Charsets.UTF_8),
+    // Event names carry spaces/parentheses, so key the card url by a url-safe encoding of the
+    // event page path rather than the raw text.
+    private fun roxieKey(path: String): String = android.util.Base64.encodeToString(
+        path.toByteArray(Charsets.UTF_8),
         android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
     )
 
-    private fun ntvTitleFromKey(key: String): String? = try {
+    private fun roxiePathFromKey(key: String): String? = try {
         String(
             android.util.Base64.decode(key, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING),
             Charsets.UTF_8
@@ -519,9 +479,8 @@ class Cstrsp : MainAPI() {
             this.posterUrl = cdnPoster(event)
         }
 
-    // One card per fixture; load() re-groups by title to recover every server's feeds.
-    private fun ntvItem(title: String): SearchResponse =
-        newLiveSearchResponse("$title [NTV]", "https://ntv.domains/${ntvKey(title)}") {}
+    private fun roxieItem(event: RoxieEvent): SearchResponse =
+        newLiveSearchResponse("${event.name} [Roxie]", "https://roxie.domains/${roxieKey(event.path)}") {}
 
     // Resolves candidates (WebView-based loadExtractor calls) with bounded concurrency
     // instead of one at a time. Each call can take up to ~15s to time out, so resolving a
@@ -752,14 +711,14 @@ class Cstrsp : MainAPI() {
         checkAndGetDomain()
         // All five upstreams fetched concurrently — one slow or dead source no longer
         // delays the whole home page. awaitAll preserves order, so sections stay stable:
-        // Streamed, PPV, WF, StreamSports, NTV.
+        // Streamed, PPV, WF, StreamSports, Roxie.
         val sections = coroutineScope {
             listOf(
                 async { safeList { streamedHomeSections() } },
                 async { safeList { ppvHomeSections() } },
                 async { safeList { wfHomeSections() } },
                 async { safeList { cdnHomeSections() } },
-                async { safeList { ntvHomeSections() } }
+                async { safeList { roxieHomeSections() } }
             ).awaitAll()
         }.flatten()
         return newHomePageResponse(sections)
@@ -804,17 +763,11 @@ class Cstrsp : MainAPI() {
             else HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", items)
         }
 
-    // One card per fixture (deduped across servers), grouped into [NTV] sections by the
-    // category of whichever server listed it first.
-    private suspend fun ntvHomeSections(): List<HomePageList> =
-        ntvLiveByTitle().entries
-            .groupBy { (_, entries) -> entries.first().second.category ?: "Other" }
-            .map { (category, fixtures) ->
-                HomePageList(
-                    "${category.replaceFirstChar { it.uppercase() }} [NTV]",
-                    fixtures.map { (title, _) -> ntvItem(title) }
-                )
-            }
+    // roxiestreams has a small hand-curated slate, so one flat [Roxie] section is enough.
+    private suspend fun roxieHomeSections(): List<HomePageList> {
+        val items = fetchRoxieEvents().map { roxieItem(it) }
+        return if (items.isEmpty()) emptyList() else listOf(HomePageList("Live Events [Roxie]", items))
+    }
 
     // --- Search ----------------------------------------------------------------------
 
@@ -836,7 +789,7 @@ class Cstrsp : MainAPI() {
                 async { safeList { searchPpv(matcher) } },
                 async { safeList { searchWf(matcher) } },
                 async { safeList { searchCdn(matcher) } },
-                async { safeList { searchNtv(matcher) } }
+                async { safeList { searchRoxie(matcher) } }
             ).awaitAll()
         }.forEach { results.addAll(it) }
 
@@ -879,10 +832,10 @@ class Cstrsp : MainAPI() {
             events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport) }.map { cdnItem(it) }
         }
 
-    private suspend fun searchNtv(matcher: QueryMatcher): List<SearchResponse> =
-        ntvLiveByTitle()
-            .filter { (title, entries) -> matcher.matches(title, entries.first().second.category) }
-            .map { (title, _) -> ntvItem(title) }
+    private suspend fun searchRoxie(matcher: QueryMatcher): List<SearchResponse> =
+        fetchRoxieEvents()
+            .filter { matcher.matches(it.name) }
+            .map { roxieItem(it) }
 
     // --- Load ----------------------------------------------------------------------
 
@@ -949,18 +902,18 @@ class Cstrsp : MainAPI() {
             }
         }
 
-        // Handle NTV Streams — url is https://ntv.domains/<url-safe base64 title>
-        if (url.startsWith("https://ntv.domains/")) {
-            val title = ntvTitleFromKey(url.substringAfterLast("/")) ?: return null
-            val entries = ntvLiveByTitle()[title] ?: return null
-            val refs = ntvRefs(entries)
-            if (refs.isEmpty()) return null
+        // Handle Roxie Streams — url is https://roxie.domains/<url-safe base64 event path>
+        if (url.startsWith("https://roxie.domains/")) {
+            val path = roxiePathFromKey(url.substringAfterLast("/")) ?: return null
+            val sources = fetchRoxieSources(path)
+            if (sources.isEmpty()) return null
+            val name = fetchRoxieEvents().find { it.path == path }?.name ?: path.trim('/').replace('-', ' ')
             return newLiveStreamLoadResponse(
-                name = "$title [NTV]",
+                name = "$name [Roxie]",
                 url = url,
-                dataUrl = NtvLoadData(title, refs).toJson()
+                dataUrl = RoxieLoadData(name, path, sources).toJson()
             ) {
-                this.plot = title
+                this.plot = name
             }
         }
 
@@ -1161,24 +1114,41 @@ class Cstrsp : MainAPI() {
             }
         } catch (e: Exception) {}
 
-        // Handle NTV Extract — one fixture's feeds, already merged + capped by load().
+        // Handle Roxie Extract — the event's buttons, already scraped by load().
         try {
-            val load = AppUtils.parseJson<NtvLoadData>(data)
-            if (load.ntvTitle.isNotBlank() && load.refs.isNotEmpty()) {
-                load.refs.resolveConcurrently { ref ->
-                    val embedUrl = ntvSourceEmbed(ref.server, ref.id, ref.index) ?: return@resolveConcurrently
-                    val base = "NTV - ${ref.server} - ${ref.label}"
-                    loadExtractor(embedUrl, "$ntvUrl/watch/${ref.server}/${ref.id}", subtitleCallback) { link ->
+            val load = AppUtils.parseJson<RoxieLoadData>(data)
+            if (load.path.isNotBlank() && load.sources.isNotEmpty()) {
+                val domains = fetchRoxieDomains()
+                val eventRef = "$roxieUrl${load.path}"
+                load.sources.resolveConcurrently { src ->
+                    if (src.kind == "raw") {
+                        // An obfuscated player page: hand off to the WebView sniffer.
+                        loadExtractor("$roxieUrl${src.value}", eventRef, subtitleCallback) { link ->
+                            callback(
+                                ExtractorLink(
+                                    source = "Roxie",
+                                    name = withQualityLabel("Roxie - ${src.label}", link.quality),
+                                    url = link.url,
+                                    referer = link.referer,
+                                    quality = link.quality,
+                                    type = link.type,
+                                    headers = link.headers,
+                                    extractorData = link.extractorData
+                                )
+                            )
+                        }
+                    } else {
+                        // Direct playlist: probe the domain pool for a live host.
+                        val m3u8 = resolveRoxieM3u8(src, domains) ?: return@resolveConcurrently
                         callback(
                             ExtractorLink(
-                                source = "NTV",
-                                name = withQualityLabel(base, link.quality),
-                                url = link.url,
-                                referer = link.referer,
-                                quality = link.quality,
-                                type = link.type,
-                                headers = link.headers,
-                                extractorData = link.extractorData
+                                source = "Roxie",
+                                name = "Roxie - ${src.label}",
+                                url = m3u8,
+                                referer = "$roxieUrl/",
+                                quality = Qualities.Unknown.value,
+                                type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8,
+                                headers = mapOf("Referer" to "$roxieUrl/", "Origin" to roxieUrl)
                             )
                         )
                     }
