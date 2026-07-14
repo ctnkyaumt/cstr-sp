@@ -16,6 +16,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 
 private const val CACHE_TTL_MS = 30_000L
+// How long after kick-off an ntv event is still treated as live. ntv publishes a start time
+// but no end time, so this is the window that stands in for one; 3h covers a football match
+// plus stoppage/overrun without dragging finished events through the rest of the evening.
+private const val NTV_EVENT_WINDOW_MS = 3 * 60 * 60 * 1000L
+// Feeds resolved per fixture. Each costs a /watch fetch plus a WebView extractor, and a
+// fixture can list 60+ across servers.
+private const val NTV_MAX_SOURCES = 8
 private const val TRT_URL = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
 private const val TRT_POSTER =
     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
@@ -220,9 +227,14 @@ class Cstrsp : MainAPI() {
         @JsonProperty("id") val id: String? = null,
         @JsonProperty("title") val title: String? = null,
         @JsonProperty("category") val category: String? = null,
+        // Unix ms of kick-off. Present on every entry, and the only liveness signal most
+        // ntv servers give us (see isLiveNtv).
         @JsonProperty("date") val date: Long? = null,
         @JsonProperty("popular") val popular: Boolean = false,
-        @JsonProperty("live") val live: Boolean = false,
+        // Nullable on purpose: only the live-capable servers emit this key at all. `false`
+        // from a schedule-only server means "unknown", not "not live", so it must not be
+        // read as an authoritative negative.
+        @JsonProperty("live") val live: Boolean? = null,
         @JsonProperty("sources") val sources: List<APISource>? = null
     )
 
@@ -232,13 +244,20 @@ class Cstrsp : MainAPI() {
         @JsonProperty("all") val all: List<NtvMatch>? = null
     )
 
-    // Carried in dataUrl from load() to loadLinks(): the server + match id needed to mint
-    // per-source tokens, plus the channel tags for labelling.
-    data class NtvLoadData(
+    // One playable feed: which server+match to mint a token from, the source index on that
+    // match's /watch page, and the channel tag to label it with.
+    data class NtvSourceRef(
         @JsonProperty("server") val server: String,
         @JsonProperty("id") val id: String,
-        @JsonProperty("title") val title: String,
-        @JsonProperty("sources") val sources: List<String>
+        @JsonProperty("index") val index: Int,
+        @JsonProperty("label") val label: String
+    )
+
+    // Carried in dataUrl from load() to loadLinks(). One fixture's feeds, merged across
+    // every server that carries it, so a single card opens a sources menu with all of them.
+    data class NtvLoadData(
+        @JsonProperty("ntvTitle") val ntvTitle: String,
+        @JsonProperty("refs") val refs: List<NtvSourceRef>
     )
 
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
@@ -308,12 +327,75 @@ class Cstrsp : MainAPI() {
         }
     }
 
-    // One server's currently-live events, minus non-sport feeds and entries with nothing to
-    // play. Cached per server so home + search + load share a single round-trip.
+    // One server's playable events, minus non-sport feeds. Cached per server so home +
+    // search + load share a single round-trip.
+    //
+    // Deliberately reads `all`, not the response's `live` array: only the live-capable
+    // servers populate that array (the streamed.pk mirror we skip), while the servers we
+    // actually use are schedule-only — their `live` array is always empty and most don't
+    // even emit a per-match `live` key. Filtering on it surfaced nothing, ever. Liveness is
+    // decided by isLiveNtv instead.
     private suspend fun fetchNtv(server: String): List<NtvMatch> = cached("ntv-$server") {
-        app.get("$ntvUrl/api/get-matches?server=$server&type=both").parsedSafe<NtvResponse>()?.live
+        app.get("$ntvUrl/api/get-matches?server=$server&type=both").parsedSafe<NtvResponse>()?.all
             ?.filter { it.id != null && it.title != null && !it.sources.isNullOrEmpty() && isNtvEvent(it.category) }
     } ?: emptyList()
+
+    // ntv gives a kick-off time but never an end time, so "live" is a window: started, and
+    // not older than NTV_EVENT_WINDOW_MS. An explicit live=true (live-capable servers only)
+    // short-circuits it; live=false is treated as unknown, since schedule-only servers emit
+    // it for matches that are in fact playable.
+    private fun isLiveNtv(match: NtvMatch): Boolean {
+        if (match.live == true) return true
+        val start = match.date ?: return false
+        val now = System.currentTimeMillis()
+        return start <= now && now - start <= NTV_EVENT_WINDOW_MS
+    }
+
+    // A fixture can be carried by several ntv servers at once (each a different upstream).
+    // Group them under one title so home/search show a single card whose sources menu holds
+    // every server's feeds — mirroring how Streamed/WF list one card per match.
+    private suspend fun ntvLiveByTitle(): Map<String, List<Pair<String, NtvMatch>>> = coroutineScope {
+        ntvServers.map { server -> async { server to safeList { fetchNtv(server) } } }.awaitAll()
+            .flatMap { (server, matches) -> matches.filter { isLiveNtv(it) }.map { server to it } }
+            .groupBy { (_, m) -> m.title!! }
+    }
+
+    // Round-robins across servers so a capped list keeps feeds from every server that has
+    // the fixture, instead of spending the whole budget on whichever one listed most.
+    private fun ntvRefs(entries: List<Pair<String, NtvMatch>>): List<NtvSourceRef> {
+        val perServer = entries.map { (server, m) ->
+            m.sources.orEmpty().mapIndexedNotNull { i, s ->
+                val id = m.id ?: return@mapIndexedNotNull null
+                NtvSourceRef(server, id, i, s.source?.takeIf { it.isNotBlank() } ?: "Source ${i + 1}")
+            }
+        }
+        val out = mutableListOf<NtvSourceRef>()
+        var i = 0
+        while (out.size < NTV_MAX_SOURCES && perServer.any { i < it.size }) {
+            for (list in perServer) {
+                if (out.size >= NTV_MAX_SOURCES) break
+                list.getOrNull(i)?.let { out.add(it) }
+            }
+            i++
+        }
+        return out
+    }
+
+    // Titles carry spaces/emoji/punctuation, so key the card url by a url-safe encoding of
+    // the title rather than the raw text.
+    private fun ntvKey(title: String): String = android.util.Base64.encodeToString(
+        title.toByteArray(Charsets.UTF_8),
+        android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
+    )
+
+    private fun ntvTitleFromKey(key: String): String? = try {
+        String(
+            android.util.Base64.decode(key, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING),
+            Charsets.UTF_8
+        )
+    } catch (e: Exception) {
+        null
+    }
 
     // Shorter display dimension (video height when played in landscape). Used to cap the
     // quality *variants* we offer to what the device can render. Int.MAX_VALUE on failure so
@@ -437,9 +519,9 @@ class Cstrsp : MainAPI() {
             this.posterUrl = cdnPoster(event)
         }
 
-    // Server is carried in the url so load() can re-fetch the right list and mint tokens.
-    private fun ntvItem(server: String, match: NtvMatch): SearchResponse =
-        newLiveSearchResponse("${match.title} [NTV]", "https://ntv.domains/$server/${match.id}") {}
+    // One card per fixture; load() re-groups by title to recover every server's feeds.
+    private fun ntvItem(title: String): SearchResponse =
+        newLiveSearchResponse("$title [NTV]", "https://ntv.domains/${ntvKey(title)}") {}
 
     // Resolves candidates (WebView-based loadExtractor calls) with bounded concurrency
     // instead of one at a time. Each call can take up to ~15s to time out, so resolving a
@@ -722,20 +804,17 @@ class Cstrsp : MainAPI() {
             else HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", items)
         }
 
-    // All ntv servers fetched concurrently, then their live events grouped by category into
-    // one set of [NTV] sections. The same fixture can appear under two servers (distinct
-    // stream providers) — that mirrors how a match already shows under both Streamed and WF.
-    private suspend fun ntvHomeSections(): List<HomePageList> = coroutineScope {
-        ntvServers.map { server -> async { server to safeList { fetchNtv(server) } } }.awaitAll()
-            .flatMap { (server, matches) -> matches.map { server to it } }
-            .groupBy { (_, m) -> m.category ?: "Other" }
-            .map { (category, entries) ->
+    // One card per fixture (deduped across servers), grouped into [NTV] sections by the
+    // category of whichever server listed it first.
+    private suspend fun ntvHomeSections(): List<HomePageList> =
+        ntvLiveByTitle().entries
+            .groupBy { (_, entries) -> entries.first().second.category ?: "Other" }
+            .map { (category, fixtures) ->
                 HomePageList(
                     "${category.replaceFirstChar { it.uppercase() }} [NTV]",
-                    entries.map { (server, m) -> ntvItem(server, m) }
+                    fixtures.map { (title, _) -> ntvItem(title) }
                 )
             }
-    }
 
     // --- Search ----------------------------------------------------------------------
 
@@ -800,12 +879,10 @@ class Cstrsp : MainAPI() {
             events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport) }.map { cdnItem(it) }
         }
 
-    private suspend fun searchNtv(matcher: QueryMatcher): List<SearchResponse> = coroutineScope {
-        ntvServers.map { server -> async { server to safeList { fetchNtv(server) } } }.awaitAll()
-            .flatMap { (server, matches) ->
-                matches.filter { matcher.matches(it.title, it.category) }.map { ntvItem(server, it) }
-            }
-    }
+    private suspend fun searchNtv(matcher: QueryMatcher): List<SearchResponse> =
+        ntvLiveByTitle()
+            .filter { (title, entries) -> matcher.matches(title, entries.first().second.category) }
+            .map { (title, _) -> ntvItem(title) }
 
     // --- Load ----------------------------------------------------------------------
 
@@ -872,18 +949,16 @@ class Cstrsp : MainAPI() {
             }
         }
 
-        // Handle NTV Streams — url is https://ntv.domains/<server>/<id>
+        // Handle NTV Streams — url is https://ntv.domains/<url-safe base64 title>
         if (url.startsWith("https://ntv.domains/")) {
-            val rest = url.removePrefix("https://ntv.domains/")
-            val server = rest.substringBefore("/")
-            val id = rest.substringAfter("/")
-            val match = fetchNtv(server).find { it.id == id } ?: return null
-            val title = match.title ?: "Live Stream"
-            val load = NtvLoadData(server, id, title, match.sources.orEmpty().mapNotNull { it.source })
+            val title = ntvTitleFromKey(url.substringAfterLast("/")) ?: return null
+            val entries = ntvLiveByTitle()[title] ?: return null
+            val refs = ntvRefs(entries)
+            if (refs.isEmpty()) return null
             return newLiveStreamLoadResponse(
                 name = "$title [NTV]",
                 url = url,
-                dataUrl = load.toJson()
+                dataUrl = NtvLoadData(title, refs).toJson()
             ) {
                 this.plot = title
             }
@@ -1086,22 +1161,18 @@ class Cstrsp : MainAPI() {
             }
         } catch (e: Exception) {}
 
-        // Handle NTV Extract
+        // Handle NTV Extract — one fixture's feeds, already merged + capped by load().
         try {
             val load = AppUtils.parseJson<NtvLoadData>(data)
-            if (load.server.isNotBlank() && load.id.isNotBlank()) {
-                // A match can list 40+ sources and each needs its own /watch fetch plus a
-                // WebView extractor, so cap it. Sources are ordered by the site's own priority.
-                val count = load.sources.size.coerceAtMost(6).coerceAtLeast(1)
-                val watchRef = "$ntvUrl/watch/${load.server}/${load.id}"
-                (0 until count).toList().resolveConcurrently { index ->
-                    val label = load.sources.getOrNull(index)?.takeIf { it.isNotBlank() } ?: "Source ${index + 1}"
-                    val embedUrl = ntvSourceEmbed(load.server, load.id, index) ?: return@resolveConcurrently
-                    loadExtractor(embedUrl, watchRef, subtitleCallback) { link ->
+            if (load.ntvTitle.isNotBlank() && load.refs.isNotEmpty()) {
+                load.refs.resolveConcurrently { ref ->
+                    val embedUrl = ntvSourceEmbed(ref.server, ref.id, ref.index) ?: return@resolveConcurrently
+                    val base = "NTV - ${ref.server} - ${ref.label}"
+                    loadExtractor(embedUrl, "$ntvUrl/watch/${ref.server}/${ref.id}", subtitleCallback) { link ->
                         callback(
                             ExtractorLink(
                                 source = "NTV",
-                                name = withQualityLabel("NTV - $label", link.quality),
+                                name = withQualityLabel(base, link.quality),
                                 url = link.url,
                                 referer = link.referer,
                                 quality = link.quality,
