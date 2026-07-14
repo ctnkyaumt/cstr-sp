@@ -269,8 +269,36 @@ class Cstrsp : MainAPI() {
             }.filter { ev -> ev.gameID != null && ev.channels?.any { !it.url.isNullOrBlank() } == true }
             if (events.isNotEmpty()) out[sport] = events
         }
-        out
+        pruneAmbiguousCdnChannels(out)
     } ?: emptyMap()
+
+    // Many cdnlivetv channels (ESPN US, Sky Sports F1, Premiere BR...) are attached to dozens
+    // of events at once. The underlying stream is the channel's *current* live broadcast, so a
+    // channel listed under more than one currently-live event can't be pinned to this one and
+    // would often resolve to an unrelated event's stream — the "unrelated sources" bug. Drop a
+    // channel when it's shared by 2+ live events, keeping channels exclusive to a single live
+    // event. When only one event is live nothing collides, so nothing is dropped.
+    private fun pruneAmbiguousCdnChannels(events: Map<String, List<CdnEvent>>): Map<String, List<CdnEvent>> {
+        val liveNameCounts = HashMap<String, Int>()
+        events.values.flatten().filter { isLiveCdn(it) }.forEach { ev ->
+            ev.channels.orEmpty()
+                .mapNotNull { ch -> ch.channelName?.takeIf { !ch.url.isNullOrBlank() } }
+                .distinct()
+                .forEach { name -> liveNameCounts[name] = (liveNameCounts[name] ?: 0) + 1 }
+        }
+        val ambiguous = liveNameCounts.filterValues { it > 1 }.keys
+        if (ambiguous.isEmpty()) return events
+
+        val cleaned = LinkedHashMap<String, List<CdnEvent>>()
+        events.forEach { (sport, list) ->
+            val kept = list
+                // Null-named channels can't be judged, so keep them.
+                .map { ev -> ev.copy(channels = ev.channels?.filter { it.channelName == null || it.channelName !in ambiguous }) }
+                .filter { ev -> ev.channels?.any { !it.url.isNullOrBlank() } == true }
+            if (kept.isNotEmpty()) cleaned[sport] = kept
+        }
+        return cleaned
+    }
 
     // Helper to fetch matches from streamed.pk
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> = cached(endpoint) {
