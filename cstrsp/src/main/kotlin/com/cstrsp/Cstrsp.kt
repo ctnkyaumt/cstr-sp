@@ -30,7 +30,11 @@ class Cstrsp : MainAPI() {
 
     private var apiUrl = "https://streamed.pk/api"
     private val cdnApiUrl = "https://api.cdnlivetv.tv/api/v1"
-    private val streamfreeUrl = "https://streamfree.top"
+    private val ntvUrl = "https://ntv.cx"
+    // ntv.cx aggregates several upstreams behind named "servers". "kobra" is a verbatim
+    // streamed.pk mirror (same ids, 100% overlap) — skip it so we don't double-list what the
+    // Streamed source already provides. The rest carry distinct events via ntv's own CDN.
+    private val ntvServers = listOf("raptor", "falcon", "phoenix", "viper")
     private var isDomainChecked = false
     private val domains = listOf("https://streamed.pk", "https://streamed.st")
 
@@ -207,46 +211,37 @@ class Cstrsp : MainAPI() {
         @JsonProperty("cdn-live-tv") val data: Map<String, Any?>? = null
     )
 
-    // streamfree.top (StreamFree)
-    data class SFStream(
-        @JsonProperty("name") val name: String? = null,
+    // ntv.cx — /api/get-matches?server=<id>&type=both. Schema mirrors streamed.pk's match
+    // shape, but teams/poster are never populated for the non-mirror servers, so we key off
+    // title + category + sources only. `sources[i].source` is a channel tag we reuse as the
+    // per-source label; the playable token isn't here — it's minted per source index by the
+    // /watch page (see loadLinks).
+    data class NtvMatch(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("title") val title: String? = null,
         @JsonProperty("category") val category: String? = null,
-        @JsonProperty("league") val league: String? = null,
-        @JsonProperty("stream_key") val streamKey: String? = null,
-        @JsonProperty("embed_url") val embedUrl: String? = null,
-        @JsonProperty("thumbnail_url") val thumbnailUrl: String? = null,
-        // Unix seconds of the event start. Absent/0/past = a 24-7 channel (always live);
-        // a future value marks a not-yet-started event we keep out of live results.
-        @JsonProperty("match_timestamp") val matchTimestamp: Long? = null
+        @JsonProperty("date") val date: Long? = null,
+        @JsonProperty("popular") val popular: Boolean = false,
+        @JsonProperty("live") val live: Boolean = false,
+        @JsonProperty("sources") val sources: List<APISource>? = null
     )
 
-    data class SFResponse(
-        @JsonProperty("streams") val streams: List<SFStream>? = null
+    data class NtvResponse(
+        @JsonProperty("live") val live: List<NtvMatch>? = null,
+        @JsonProperty("nonLive") val nonLive: List<NtvMatch>? = null,
+        @JsonProperty("all") val all: List<NtvMatch>? = null
     )
 
-    // streamfree.top builds its m3u8 in JS from three pieces: a token map embedded in
-    // the embed page (_0x), the current server from /get-stream-key, and the available
-    // quality from /api/stream-status. A headless WebView can't complete the player
-    // init chain, so we replicate that construction directly.
-    data class SFStreamKey(
-        @JsonProperty("is_external") val isExternal: Boolean? = false,
-        @JsonProperty("external_url") val externalUrl: String? = null,
-        @JsonProperty("server_name") val serverName: String? = null
-    )
-
-    data class SFStatus(
-        @JsonProperty("qualities") val qualities: Map<String, Boolean>? = null
-    )
-
-    data class SFToken(
-        @JsonProperty("_t") val t: String? = null,
-        @JsonProperty("_e") val e: Long? = null,
-        @JsonProperty("_n") val n: String? = null
+    // Carried in dataUrl from load() to loadLinks(): the server + match id needed to mint
+    // per-source tokens, plus the channel tags for labelling.
+    data class NtvLoadData(
+        @JsonProperty("server") val server: String,
+        @JsonProperty("id") val id: String,
+        @JsonProperty("title") val title: String,
+        @JsonProperty("sources") val sources: List<String>
     )
 
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
-
-    private val sfTokenRegex = Regex("const _0x = (\\{.*?\\});")
 
     private suspend fun fetchPPVApi(): PPVResponse? = cached("ppv") {
         ppvDomains.firstNotNullOfOrNull { domain ->
@@ -281,23 +276,44 @@ class Cstrsp : MainAPI() {
         out
     } ?: emptyMap()
 
-    private suspend fun fetchSFStreams(): List<SFStream> = cached("sf") {
-        app.get("$streamfreeUrl/api/v1/streams").parsedSafe<SFResponse>()?.streams
-            ?.filter { it.name != null && it.embedUrl != null && it.streamKey != null }
-    } ?: emptyList()
-
     // Helper to fetch matches from streamed.pk
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> = cached(endpoint) {
         app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList()?.filter { it.id != null && it.title != null }
     } ?: emptyList()
 
-    private fun sfQuality(q: String): Int = when (q) {
-        "2160p" -> Qualities.P2160.value
-        "1080p" -> Qualities.P1080.value
-        "720p" -> Qualities.P720.value
-        "540p" -> Qualities.P480.value
-        else -> Qualities.Unknown.value
+    // ntv category markers for non-sport feeds (24-7 TV channels, reality-show cameras).
+    // We surface events only, so anything whose category matches one of these is dropped.
+    private val ntvNonEventMarkers = listOf(
+        "tv show", "big brother", "live camera", "camera feed", "live feed", "24 7", "channel"
+    )
+
+    private fun isNtvEvent(category: String?): Boolean {
+        val c = normalizeText(category ?: return true)
+        return ntvNonEventMarkers.none { c.contains(it) }
     }
+
+    // The /watch page mints a fresh, opaque embed token per source index; we pull it out of
+    // the player iframe's src (`/embed?t=<token>`). Tokens end in a URL-safe '~' (a '=' the
+    // site swapped), so the class includes it — it must be passed to /embed verbatim.
+    private val ntvEmbedRegex = Regex("/embed\\?t=([A-Za-z0-9._~=+/-]+)")
+
+    // Fetches the embed url for one source index of an ntv match. Each source is a separate
+    // /watch fetch because the token is per (match, source) — there's no batch endpoint.
+    private suspend fun ntvSourceEmbed(server: String, id: String, index: Int): String? {
+        return try {
+            val html = app.get("$ntvUrl/watch/$server/$id?source=$index", referer = "$ntvUrl/").text
+            ntvEmbedRegex.find(html)?.groupValues?.get(1)?.let { "$ntvUrl/embed?t=$it" }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // One server's currently-live events, minus non-sport feeds and entries with nothing to
+    // play. Cached per server so home + search + load share a single round-trip.
+    private suspend fun fetchNtv(server: String): List<NtvMatch> = cached("ntv-$server") {
+        app.get("$ntvUrl/api/get-matches?server=$server&type=both").parsedSafe<NtvResponse>()?.live
+            ?.filter { it.id != null && it.title != null && !it.sources.isNullOrEmpty() && isNtvEvent(it.category) }
+    } ?: emptyList()
 
     // Shorter display dimension (video height when played in landscape). Used to cap the
     // quality *variants* we offer to what the device can render. Int.MAX_VALUE on failure so
@@ -310,9 +326,9 @@ class Cstrsp : MainAPI() {
     // Appends the resolved quality to a source label, e.g. "WF - alpha" -> "WF - alpha (1080p)",
     // using CloudStream's own int->label mapping so the name matches the quality badge exactly.
     // No-op when the quality is unknown, so we never fabricate a resolution we didn't detect.
-    // The device-resolution cap is enforced as an *offer* filter (see resolveStreamFree),
-    // i.e. by not listing redundant above-device variants — NOT by relabeling, which used to
-    // mislabel genuine 1080p streams as 720p on 720p panels. Labels always show the real stream.
+    // The device-resolution cap is enforced as a filter in loadLinks, i.e. by dropping
+    // above-device variants — NOT by relabeling, which used to mislabel genuine 1080p
+    // streams as 720p on 720p panels. Labels always show the real stream.
     private fun withQualityLabel(base: String, quality: Int): String {
         val label = Qualities.getStringByInt(quality)
         return if (label.isEmpty()) base else "$base ($label)"
@@ -360,15 +376,6 @@ class Cstrsp : MainAPI() {
         return s.isEmpty() || s !in cdnNotLiveStatuses
     }
 
-    // StreamFree: a 24-7 channel has no/zero/past match_timestamp (always live); a future
-    // timestamp is a not-yet-started event. We can't detect "finished" (no end time), but
-    // resolveStreamFree only yields links for a currently-live playlist, so stale entries
-    // simply resolve to nothing — the important case here is hiding upcoming events.
-    private fun isLiveSf(stream: SFStream): Boolean {
-        val ts = stream.matchTimestamp ?: return true
-        return ts <= 0L || ts * 1000L <= System.currentTimeMillis()
-    }
-
     // PPV exposes a [starts_at, ends_at] window (unix seconds) plus a 24-7 flag (boolean on
     // the category, int 0/1 on the stream). A stream is live now if it's a 24-7 channel, or
     // it has started and not yet ended. Most PPV entries at any moment are future events, so
@@ -382,66 +389,6 @@ class Cstrsp : MainAPI() {
         if (start > 0L && now < start) return false          // not started yet -> upcoming
         if (end > 0L && now > end + 1800L) return false        // finished (with overrun grace)
         return true
-    }
-
-    // Resolves a StreamFree embed to playable links, one per live quality. Each entry is
-    // (url, isM3u8, quality): a direct m3u8 (isM3u8 = true) for hosted streams, or an
-    // external embed url to hand off to loadExtractor (isM3u8 = false). Empty if the
-    // stream isn't currently live. The embed page's own player defaults to 720p but its
-    // selector offers every quality, and each quality has its own signed URL — so emit
-    // them all instead of just the default, otherwise the app is locked to 720p.
-    private suspend fun resolveStreamFree(key: String, embedUrl: String): List<Triple<String, Boolean, String>> = coroutineScope {
-        val ref = "$streamfreeUrl/"
-        val sk = try {
-            app.get("$streamfreeUrl/get-stream-key/$key", referer = ref).parsedSafe<SFStreamKey>()
-        } catch (e: Exception) {
-            null
-        } ?: return@coroutineScope emptyList()
-
-        if (sk.isExternal == true && sk.externalUrl != null) return@coroutineScope listOf(Triple(sk.externalUrl, false, "720p"))
-
-        // The status endpoint and the embed page (token map) are independent — fetch both
-        // concurrently instead of back to back.
-        val qualitiesDeferred = async {
-            try {
-                app.get("$streamfreeUrl/api/stream-status/$key", referer = ref).parsedSafe<SFStatus>()?.qualities
-            } catch (e: Exception) {
-                null
-            }.orEmpty()
-        }
-        val tokensDeferred = async {
-            try {
-                val html = app.get(embedUrl, referer = ref).text
-                sfTokenRegex.find(html)?.groupValues?.get(1)?.let { AppUtils.parseJson<Map<String, SFToken>>(it) }
-            } catch (e: Exception) {
-                null
-            }
-        }
-        val qualities = qualitiesDeferred.await()
-        val tokens = tokensDeferred.await() ?: return@coroutineScope emptyList()
-
-        val maxH = deviceMaxHeight()
-        fun fitsDevice(q: String) = (q.removeSuffix("p").toIntOrNull() ?: 0) <= maxH
-        // Highest -> lowest, so the last element is always the lowest available quality.
-        val live = listOf("2160p", "1080p", "720p", "540p").filter { qualities[it] == true }
-        val tryQualities = if (live.isNotEmpty()) {
-            // Offer filter: don't list variants above the device's resolution (a 1080p panel
-            // has no use for the 2160p feed). But never drop the stream entirely — if nothing
-            // fits, keep the single lowest available so the device can still downscale-play it.
-            live.filter { fitsDevice(it) }.ifEmpty { listOf(live.last()) }
-        } else {
-            // Status endpoint can be empty right at stream start; probe the common qualities
-            // (device-capped, with a floor) rather than dropping the stream.
-            listOf("1080p", "720p").filter { fitsDevice(it) }.ifEmpty { listOf("720p") }
-        }
-
-        val prefix = if ((sk.serverName ?: "origin") != "origin") "live-cdn" else "live"
-        tryQualities.mapNotNull { quality ->
-            val token = tokens[quality] ?: return@mapNotNull null
-            if (token.t == null || token.e == null || token.n == null) return@mapNotNull null
-            val url = "$streamfreeUrl/$prefix/$key$quality/index.m3u8?_t=${token.t}&_e=${token.e}&_n=${token.n}"
-            Triple(url, true, quality)
-        }
     }
 
     private fun streamedPoster(match: APIMatch): String? = when {
@@ -490,10 +437,9 @@ class Cstrsp : MainAPI() {
             this.posterUrl = cdnPoster(event)
         }
 
-    private fun sfItem(stream: SFStream): SearchResponse =
-        newLiveSearchResponse("${stream.name} [StreamFree]", "https://sf.domains/${stream.streamKey}") {
-            this.posterUrl = stream.thumbnailUrl
-        }
+    // Server is carried in the url so load() can re-fetch the right list and mint tokens.
+    private fun ntvItem(server: String, match: NtvMatch): SearchResponse =
+        newLiveSearchResponse("${match.title} [NTV]", "https://ntv.domains/$server/${match.id}") {}
 
     // Resolves candidates (WebView-based loadExtractor calls) with bounded concurrency
     // instead of one at a time. Each call can take up to ~15s to time out, so resolving a
@@ -724,14 +670,14 @@ class Cstrsp : MainAPI() {
         checkAndGetDomain()
         // All five upstreams fetched concurrently — one slow or dead source no longer
         // delays the whole home page. awaitAll preserves order, so sections stay stable:
-        // Streamed, PPV, WF, StreamSports, StreamFree.
+        // Streamed, PPV, WF, StreamSports, NTV.
         val sections = coroutineScope {
             listOf(
                 async { safeList { streamedHomeSections() } },
                 async { safeList { ppvHomeSections() } },
                 async { safeList { wfHomeSections() } },
                 async { safeList { cdnHomeSections() } },
-                async { safeList { sfHomeSections() } }
+                async { safeList { ntvHomeSections() } }
             ).awaitAll()
         }.flatten()
         return newHomePageResponse(sections)
@@ -776,13 +722,20 @@ class Cstrsp : MainAPI() {
             else HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", items)
         }
 
-    private suspend fun sfHomeSections(): List<HomePageList> =
-        fetchSFStreams()
-            .filter { isLiveSf(it) }
-            .groupBy { it.category ?: "Other" }
-            .map { (category, streams) ->
-                HomePageList("${category.replaceFirstChar { it.uppercase() }} [StreamFree]", streams.map { sfItem(it) })
+    // All ntv servers fetched concurrently, then their live events grouped by category into
+    // one set of [NTV] sections. The same fixture can appear under two servers (distinct
+    // stream providers) — that mirrors how a match already shows under both Streamed and WF.
+    private suspend fun ntvHomeSections(): List<HomePageList> = coroutineScope {
+        ntvServers.map { server -> async { server to safeList { fetchNtv(server) } } }.awaitAll()
+            .flatMap { (server, matches) -> matches.map { server to it } }
+            .groupBy { (_, m) -> m.category ?: "Other" }
+            .map { (category, entries) ->
+                HomePageList(
+                    "${category.replaceFirstChar { it.uppercase() }} [NTV]",
+                    entries.map { (server, m) -> ntvItem(server, m) }
+                )
             }
+    }
 
     // --- Search ----------------------------------------------------------------------
 
@@ -804,7 +757,7 @@ class Cstrsp : MainAPI() {
                 async { safeList { searchPpv(matcher) } },
                 async { safeList { searchWf(matcher) } },
                 async { safeList { searchCdn(matcher) } },
-                async { safeList { searchSf(matcher) } }
+                async { safeList { searchNtv(matcher) } }
             ).awaitAll()
         }.forEach { results.addAll(it) }
 
@@ -847,13 +800,12 @@ class Cstrsp : MainAPI() {
             events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport) }.map { cdnItem(it) }
         }
 
-    private suspend fun searchSf(matcher: QueryMatcher): List<SearchResponse> =
-        fetchSFStreams()
-            .filter { stream ->
-                stream.name != null && isLiveSf(stream) &&
-                    matcher.matches(stream.name, stream.category, stream.league)
+    private suspend fun searchNtv(matcher: QueryMatcher): List<SearchResponse> = coroutineScope {
+        ntvServers.map { server -> async { server to safeList { fetchNtv(server) } } }.awaitAll()
+            .flatMap { (server, matches) ->
+                matches.filter { matcher.matches(it.title, it.category) }.map { ntvItem(server, it) }
             }
-            .map { sfItem(it) }
+    }
 
     // --- Load ----------------------------------------------------------------------
 
@@ -920,17 +872,19 @@ class Cstrsp : MainAPI() {
             }
         }
 
-        // Handle StreamFree Streams
-        if (url.startsWith("https://sf.domains/")) {
-            val key = url.substringAfterLast("/")
-            val stream = fetchSFStreams().find { it.streamKey == key } ?: return null
-            val title = stream.name ?: "Live Stream"
+        // Handle NTV Streams — url is https://ntv.domains/<server>/<id>
+        if (url.startsWith("https://ntv.domains/")) {
+            val rest = url.removePrefix("https://ntv.domains/")
+            val server = rest.substringBefore("/")
+            val id = rest.substringAfter("/")
+            val match = fetchNtv(server).find { it.id == id } ?: return null
+            val title = match.title ?: "Live Stream"
+            val load = NtvLoadData(server, id, title, match.sources.orEmpty().mapNotNull { it.source })
             return newLiveStreamLoadResponse(
-                name = "$title [StreamFree]",
+                name = "$title [NTV]",
                 url = url,
-                dataUrl = stream.toJson()
+                dataUrl = load.toJson()
             ) {
-                this.posterUrl = stream.thumbnailUrl
                 this.plot = title
             }
         }
@@ -1132,43 +1086,30 @@ class Cstrsp : MainAPI() {
             }
         } catch (e: Exception) {}
 
-        // Handle StreamFree Extract
+        // Handle NTV Extract
         try {
-            val stream = AppUtils.parseJson<SFStream>(data)
-            val key = stream.streamKey
-            if (stream.embedUrl != null && key != null) {
-                val label = stream.name ?: "Live"
-                resolveStreamFree(key, stream.embedUrl).forEach { (streamUrl, isM3u8, quality) ->
-                    if (isM3u8) {
-                        // `quality` here is StreamFree's own authoritative quality string
-                        // (e.g. "1080p") for this signed URL, so use it verbatim in the name.
+            val load = AppUtils.parseJson<NtvLoadData>(data)
+            if (load.server.isNotBlank() && load.id.isNotBlank()) {
+                // A match can list 40+ sources and each needs its own /watch fetch plus a
+                // WebView extractor, so cap it. Sources are ordered by the site's own priority.
+                val count = load.sources.size.coerceAtMost(6).coerceAtLeast(1)
+                val watchRef = "$ntvUrl/watch/${load.server}/${load.id}"
+                (0 until count).toList().resolveConcurrently { index ->
+                    val label = load.sources.getOrNull(index)?.takeIf { it.isNotBlank() } ?: "Source ${index + 1}"
+                    val embedUrl = ntvSourceEmbed(load.server, load.id, index) ?: return@resolveConcurrently
+                    loadExtractor(embedUrl, watchRef, subtitleCallback) { link ->
                         callback(
                             ExtractorLink(
-                                source = "StreamFree",
-                                name = "StreamFree - $label ($quality)",
-                                url = streamUrl,
-                                referer = "$streamfreeUrl/",
-                                quality = sfQuality(quality),
-                                type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8,
-                                headers = mapOf("Referer" to "$streamfreeUrl/")
+                                source = "NTV",
+                                name = withQualityLabel("NTV - $label", link.quality),
+                                url = link.url,
+                                referer = link.referer,
+                                quality = link.quality,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData
                             )
                         )
-                    } else {
-                        // External embed on another host: hand off to the extractors.
-                        loadExtractor(streamUrl, "$streamfreeUrl/", subtitleCallback) { link ->
-                            callback(
-                                ExtractorLink(
-                                    source = "StreamFree",
-                                    name = withQualityLabel("StreamFree - $label", link.quality),
-                                    url = link.url,
-                                    referer = link.referer,
-                                    quality = link.quality,
-                                    type = link.type,
-                                    headers = link.headers,
-                                    extractorData = link.extractorData
-                                )
-                            )
-                        }
                     }
                 }
                 return true

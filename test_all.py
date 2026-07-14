@@ -20,21 +20,6 @@ def get_json(url, referer=None):
         print(f"Error fetching JSON from {url}: {e}")
         return None
 
-def test_streamfree():
-    print("\n========================================")
-    print("--- TESTING STREAMFREE ---")
-    res = get_json("https://streamfree.top/api/v1/streams")
-    if not res:
-        print("Failed to fetch StreamFree streams.")
-        return
-    streams = res.get("streams", [])
-    print(f"Found {len(streams)} StreamFree streams.")
-    for s in streams[:3]:
-        name = s.get("name")
-        key = s.get("stream_key")
-        embed_url = s.get("embed_url")
-        print(f"- Stream: {name} (key={key}, embed_url={embed_url})")
-
 def test_wf():
     print("\n========================================")
     print("--- TESTING WATCHFOOTY (WF) ---")
@@ -75,6 +60,22 @@ def test_ppv():
             iframe_part = s.get('iframe')[:60] if s.get('iframe') else 'None'
             print(f"  * Stream: {s.get('name')} | iframe: {iframe_part}...")
 
+def test_ntv():
+    print("\n========================================")
+    print("--- TESTING NTV (ntv.cx) ---")
+    # kobra == streamed.pk mirror, skipped in the plugin
+    for server in ["raptor", "falcon", "phoenix", "viper"]:
+        res = get_json(f"https://ntv.cx/api/get-matches?server={server}&type=both", referer="https://ntv.cx/")
+        if not res or not res.get("success"):
+            print(f"- {server}: failed")
+            continue
+        live = res.get("live", [])
+        allm = res.get("all", [])
+        print(f"- {server}: {len(allm)} matches, {len(live)} live")
+        for m in (live or allm)[:2]:
+            title = m.get("title", "").encode("ascii", "replace").decode()
+            print(f"    * {title} [{m.get('category')}] sources={len(m.get('sources') or [])}")
+
 def test_streamed():
     print("\n========================================")
     print("--- TESTING STREAMED ---")
@@ -90,7 +91,7 @@ def test_streamed():
         print(f"- Match: '{title}' with sources: {[s.get('source') for s in sources]}")
 
 if __name__ == "__main__":
-    test_streamfree()
     test_wf()
     test_ppv()
     test_streamed()
+    test_ntv()
