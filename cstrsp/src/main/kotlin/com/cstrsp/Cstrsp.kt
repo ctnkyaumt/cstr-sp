@@ -32,7 +32,7 @@ class Cstrsp : MainAPI() {
     private val cdnApiUrl = "https://api.cdnlivetv.tv/api/v1"
     private val roxieUrl = "https://roxiestreams.su"
     // Last roxie CDN host that served a valid playlist. The site rotates m3u8 across a pool
-    // of domains (domainsz56.txt) and only some answer at any moment (the rest are
+    // of domains (see fetchRoxieDomains) and only some answer at any moment (the rest are
     // Cloudflare-blocked), so we remember a working one and try it first next time.
     @Volatile private var roxieGoodDomain: String? = null
     private var isDomainChecked = false
@@ -229,12 +229,22 @@ class Cstrsp : MainAPI() {
         @JsonProperty("subdomain") val subdomain: String = ""
     )
 
-    // Carried in dataUrl from load() to loadLinks(): the event page path plus its scraped
-    // buttons, so loadLinks resolves them without re-fetching the page.
+    // One event page's scrape: its player buttons plus the name of the CDN-host list file
+    // that page loads (fetch('domainsz58.txt')). The number rotates over time AND differs
+    // per event, so it must be read from the page, never hardcoded.
+    data class RoxiePage(
+        val sources: List<RoxieSource>,
+        val domainsFile: String
+    )
+
+    // Carried in dataUrl from load() to loadLinks(): the event page path, its scraped
+    // buttons, and the per-event domains file, so loadLinks resolves them without
+    // re-fetching the page. domainsFile has a default so older in-flight cards still parse.
     data class RoxieLoadData(
         @JsonProperty("name") val name: String,
         @JsonProperty("path") val path: String,
-        @JsonProperty("sources") val sources: List<RoxieSource>
+        @JsonProperty("sources") val sources: List<RoxieSource>,
+        @JsonProperty("domainsFile") val domainsFile: String = "domainsz58.txt"
     )
 
     private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
@@ -315,6 +325,9 @@ class Cstrsp : MainAPI() {
     // playIframePlayer('/raw/ctv')
     private val roxieRawRegex = Regex("playIframePlayer\\(\\s*'([^']+)'\\s*\\)")
     private val roxieTagRegex = Regex("<[^>]+>")
+    // The CDN-host list the page fetches, e.g. fetch('domainsz58.txt'). Rotates over time
+    // and varies per event page, so we read the current name instead of pinning one.
+    private val roxieDomainsFileRegex = Regex("domainsz\\d+\\.txt")
 
     // The homepage "Upcoming Events" table, one card per row. Cached; shared by home/search/load.
     private suspend fun fetchRoxieEvents(): List<RoxieEvent> = cached("roxie-events") {
@@ -329,17 +342,20 @@ class Cstrsp : MainAPI() {
             .takeIf { it.isNotEmpty() }
     } ?: emptyList()
 
-    // The CDN host pool for direct m3u8 playback (newline-separated, with duplicates).
-    private suspend fun fetchRoxieDomains(): List<String> = cached("roxie-domains") {
-        app.get("$roxieUrl/domainsz56.txt", referer = "$roxieUrl/").text
+    // The CDN host pool for direct m3u8 playback (newline-separated, with duplicates). The
+    // file name is per-event (see fetchRoxiePage); pinning a single one silently breaks all
+    // direct playback the moment the site rotates the number.
+    private suspend fun fetchRoxieDomains(file: String): List<String> = cached("roxie-domains-$file") {
+        app.get("$roxieUrl/$file", referer = "$roxieUrl/").text
             .lines().map { it.trim() }.filter { it.isNotBlank() }.distinct()
             .takeIf { it.isNotEmpty() }
     } ?: emptyList()
 
-    // Scrapes one event page's player buttons into resolvable sources.
-    private suspend fun fetchRoxieSources(path: String): List<RoxieSource> = cached("roxie-src-$path") {
+    // Scrapes one event page into its player buttons plus the domains-file name that page
+    // uses for direct m3u8 hosts. Both come from the same fetch, so we grab them together.
+    private suspend fun fetchRoxiePage(path: String): RoxiePage = cached("roxie-page-$path") {
         val html = app.get("$roxieUrl$path", referer = "$roxieUrl/").text
-        roxieButtonRegex.findAll(html).mapNotNull { m ->
+        val sources = roxieButtonRegex.findAll(html).mapNotNull { m ->
             val onclick = m.groupValues[1]
             val label = roxieTagRegex.replace(m.groupValues[2], "").trim().ifBlank { "Stream" }
             roxieGetStreamRegex.find(onclick)?.let {
@@ -349,8 +365,10 @@ class Cstrsp : MainAPI() {
                 return@mapNotNull RoxieSource(label, "raw", it.groupValues[1])
             }
             null
-        }.toList().takeIf { it.isNotEmpty() }
-    } ?: emptyList()
+        }.toList()
+        val domainsFile = roxieDomainsFileRegex.find(html)?.value ?: "domainsz58.txt"
+        RoxiePage(sources, domainsFile).takeIf { sources.isNotEmpty() }
+    } ?: RoxiePage(emptyList(), "domainsz58.txt")
 
     // Resolves an m3u8 source to a playable playlist url, or null. Tries the last-known-good
     // domain first, then the rest, accepting the first that returns a real HLS playlist —
@@ -933,13 +951,13 @@ class Cstrsp : MainAPI() {
         // Handle Roxie Streams — url is https://roxie.domains/<url-safe base64 event path>
         if (url.startsWith("https://roxie.domains/")) {
             val path = roxiePathFromKey(url.substringAfterLast("/")) ?: return null
-            val sources = fetchRoxieSources(path)
-            if (sources.isEmpty()) return null
+            val page = fetchRoxiePage(path)
+            if (page.sources.isEmpty()) return null
             val name = fetchRoxieEvents().find { it.path == path }?.name ?: path.trim('/').replace('-', ' ')
             return newLiveStreamLoadResponse(
                 name = "$name [Roxie]",
                 url = url,
-                dataUrl = RoxieLoadData(name, path, sources).toJson()
+                dataUrl = RoxieLoadData(name, path, page.sources, page.domainsFile).toJson()
             ) {
                 this.plot = name
             }
@@ -1146,7 +1164,7 @@ class Cstrsp : MainAPI() {
         try {
             val load = AppUtils.parseJson<RoxieLoadData>(data)
             if (load.path.isNotBlank() && load.sources.isNotEmpty()) {
-                val domains = fetchRoxieDomains()
+                val domains = fetchRoxieDomains(load.domainsFile)
                 val eventRef = "$roxieUrl${load.path}"
                 load.sources.resolveConcurrently { src ->
                     if (src.kind == "raw") {
