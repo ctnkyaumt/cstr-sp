@@ -206,6 +206,10 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     candidates.filter { it.isMaster == null }.sortedBy { it.seq } +
                     candidates.filter { it.isMaster == false }.sortedBy { it.seq }
                 ).distinctBy { it.url }
+                // Bounded: each probe costs a round-trip and up to two header variants are
+                // tried per candidate, so an unbounded list would leave the user staring at a
+                // spinner. The best candidates are already first.
+                .take(3)
             // Don't hand the player a URL the CDN refuses — that is exactly the 2004 the user
             // sees. Re-requesting a live HLS playlist is safe (every player polls them
             // continuously); media segments, which can be single-use, are never probed.
@@ -311,8 +315,8 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
         private fun isServable(target: String, headers: Map<String, String>): Boolean = try {
             val conn = (URL(target).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 4000
-                readTimeout = 4000
+                connectTimeout = 2500
+                readTimeout = 2500
                 instanceFollowRedirects = true
             }
             headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
