@@ -9,13 +9,13 @@
             "cstrsp"
         ],
         "description": "strmd.link parser extension",
-        "fileSize": 101146,
+        "fileSize": 102865,
         "repositoryUrl": "https://github.com/ctnkyaumt/cstr-sp",
         "language": "en",
         "tvTypes": [
             "Live"
         ],
         "apiVersion": 1,
-        "fileHash": "sha256-eac19fef30d7be3040aaa5876de344c835e51882fe50cc1369e31dbf820309c4"
+        "fileHash": "sha256-61585879666330be8b7618030f51bfc003885273a6f998016086248903f986bb"
     }
 ]
