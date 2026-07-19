@@ -3,9 +3,13 @@ package com.cstrsp
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newDrmExtractorLink
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.fasterxml.jackson.annotation.JsonProperty
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -338,6 +342,24 @@ class Cstrsp : MainAPI() {
     // The CDN-host list the page fetches, e.g. fetch('domainsz58.txt'). Rotates over time
     // and varies per event page, so we read the current name instead of pinning one.
     private val roxieDomainsFileRegex = Regex("domainsz\\d+\\.txt")
+    // A /raw/ player page is plain (un-obfuscated) Shaka JS: `player.load("<manifest>")`
+    // plus a ClearKey map `{"<kid hex32>": "<key hex32>"}`.
+    private val roxieLoadCallRegex = Regex("\\.load\\(\\s*[\"']([^\"']+)[\"']")
+    private val roxieManifestRegex = Regex("https?://[^\\s\"'<>]+\\.(?:mpd|m3u8)[^\\s\"'<>]*")
+    private val roxieClearKeyRegex =
+        Regex("[\"']([0-9a-fA-F]{32})[\"']\\s*:\\s*[\"']([0-9a-fA-F]{32})[\"']")
+
+    // WF's sportsembed.su page is only an ad wrapper — the real player sits in a nested
+    // iframe (embedindia.st, the same host PPV uses successfully). The WebView sniffer gets
+    // torn down by the wrapper's pop-ad scripts before the inner player requests anything,
+    // which is why WF returned "no links found". Unwrap to the inner URL and extract that.
+    // Falls back to the original URL when there's no iframe.
+    private val iframeSrcRegex = Regex("<iframe[^>]+src=\"([^\"]+)\"", RegexOption.IGNORE_CASE)
+
+    private suspend fun unwrapWfEmbed(url: String): String = cached("wf-embed-$url") {
+        val html = app.get(url, referer = "https://api.watchfooty.st/").text
+        iframeSrcRegex.find(html)?.groupValues?.get(1)?.takeIf { it.startsWith("http") }
+    } ?: url
 
     // The homepage "Upcoming Events" table, one card per row. Cached; shared by home/search/load.
     private suspend fun fetchRoxieEvents(): List<RoxieEvent> = cached("roxie-events") {
@@ -1154,7 +1176,9 @@ class Cstrsp : MainAPI() {
                     // from the *detected* quality below, not from WF's static quality hint
                     // (which is what was mislabeling 1080p feeds as 720p).
                     val base = listOfNotNull(stream.source, stream.language).joinToString(" - ").ifBlank { "Live" }
-                    loadExtractor(encodeUrlNonAscii(stream.url!!), "https://api.watchfooty.st/", subtitleCallback) { link ->
+                    // Referer is the wrapper page, mirroring what the browser sends the inner player.
+                    val embed = encodeUrlNonAscii(unwrapWfEmbed(stream.url!!))
+                    loadExtractor(embed, stream.url, subtitleCallback) { link ->
                         var resolvedQuality = if (link.quality != Qualities.Unknown.value) link.quality else wfQuality(stream.quality)
                         val nameLower = link.name.lowercase()
                         val urlLower = link.url.lowercase()
@@ -1219,21 +1243,57 @@ class Cstrsp : MainAPI() {
                 val eventRef = "$roxieUrl${load.path}"
                 load.sources.resolveConcurrently { src ->
                     if (src.kind == "raw") {
-                        // An obfuscated player page: hand off to the WebView sniffer.
-                        loadExtractor("$roxieUrl${src.value}", eventRef, subtitleCallback) { link ->
-                            callback(
-                                ExtractorLink(
-                                    source = "Roxie",
-                                    name = withQualityLabel("Roxie - ${src.label}", link.quality),
-                                    url = link.url,
-                                    referer = link.referer,
-                                    quality = link.quality,
-                                    type = link.type,
-                                    headers = link.headers,
-                                    extractorData = link.extractorData
+                        // The /raw/ player page is plain Shaka JS holding a DASH manifest and
+                        // ClearKey pairs. The WebView sniffer only ever captures HLS (".m3u"
+                        // URLs / "#EXTM" bodies), so it always came up empty here — hence
+                        // "no links found". Parse the page directly instead.
+                        val page = app.get("$roxieUrl${src.value}", referer = eventRef).text
+                        val manifest = roxieLoadCallRegex.find(page)?.groupValues?.get(1)
+                            ?: roxieManifestRegex.find(page)?.value
+                        if (manifest == null) {
+                            // Not a Shaka page — fall back to the WebView sniffer.
+                            loadExtractor("$roxieUrl${src.value}", eventRef, subtitleCallback) { link ->
+                                callback(
+                                    ExtractorLink(
+                                        source = "Roxie",
+                                        name = withQualityLabel("Roxie - ${src.label}", link.quality),
+                                        url = link.url,
+                                        referer = link.referer,
+                                        quality = link.quality,
+                                        type = link.type,
+                                        headers = link.headers,
+                                        extractorData = link.extractorData
+                                    )
                                 )
-                            )
+                            }
+                            return@resolveConcurrently
                         }
+                        val linkType =
+                            if (manifest.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
+                        val keys = roxieClearKeyRegex.find(page)
+                        val link = if (keys != null) {
+                            newDrmExtractorLink(
+                                source = "Roxie",
+                                name = "Roxie - ${src.label}",
+                                url = manifest,
+                                type = linkType,
+                                uuid = CLEARKEY_UUID
+                            ) {
+                                this.kid = keys.groupValues[1]
+                                this.key = keys.groupValues[2]
+                                this.referer = "$roxieUrl/"
+                            }
+                        } else {
+                            newExtractorLink(
+                                source = "Roxie",
+                                name = "Roxie - ${src.label}",
+                                url = manifest,
+                                type = linkType
+                            ) {
+                                this.referer = "$roxieUrl/"
+                            }
+                        }
+                        callback(link)
                     } else {
                         // Direct playlist: probe the domain pool for a live host.
                         val m3u8 = resolveRoxieM3u8(src, domains) ?: return@resolveConcurrently
