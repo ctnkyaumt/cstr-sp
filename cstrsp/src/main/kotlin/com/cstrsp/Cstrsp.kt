@@ -36,7 +36,12 @@ class Cstrsp : MainAPI() {
     // Cloudflare-blocked), so we remember a working one and try it first next time.
     @Volatile private var roxieGoodDomain: String? = null
     private var isDomainChecked = false
-    private val domains = listOf("https://streamed.pk", "https://streamed.st")
+    // Several interchangeable mirrors of the same backend. Some ISPs (notably in TR) block
+    // individual mirrors by DNS, so we keep a few and pick the first that actually serves
+    // data — see checkAndGetDomain. Order = preference when more than one is reachable.
+    private val domains = listOf(
+        "https://streamed.pk", "https://streamed.st", "https://streamed.su", "https://streami.su"
+    )
 
     // Short-lived response cache. A normal flow (home/search -> click -> play) hits the
     // same upstream list APIs three times within seconds; only the first call should pay
@@ -66,15 +71,20 @@ class Cstrsp : MainAPI() {
         for (domain in domains) {
             try {
                 val response = app.get("$domain/api/matches/live")
-                if (response.code in 200..299) {
+                // Accept a mirror only when its body actually parses to matches. A
+                // DNS-blocked/hijacked mirror can answer 200 with a stub page (some ISPs
+                // return a placeholder instead of NXDOMAIN), which a status-only check would
+                // accept — pinning us to a dead host so the whole Streamed source silently
+                // vanishes. Requiring real data lets us fall through to the next mirror.
+                val parsed = response.parsedSafe<Array<APIMatch>>()?.toList()
+                    ?.filter { it.id != null && it.title != null }
+                if (response.code in 200..299 && !parsed.isNullOrEmpty()) {
                     mainUrl = domain
                     apiUrl = "$domain/api"
                     isDomainChecked = true
                     // The probe body IS the live-matches list; seed the cache so the
                     // fetch that immediately follows doesn't repeat the same request.
-                    response.parsedSafe<Array<APIMatch>>()?.toList()
-                        ?.filter { it.id != null && it.title != null }
-                        ?.let { putCache("$apiUrl/matches/live", it) }
+                    putCache("$apiUrl/matches/live", parsed)
                     return
                 }
             } catch (e: Exception) {}
