@@ -175,15 +175,33 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                 ?: candidates.filter { it.isMaster == null }.minByOrNull { it.seq }
                 ?: candidates.minByOrNull { it.seq }
             chosen?.let { c ->
+                // WebView strips Referer/Origin from requestHeaders for JS-issued (XHR/fetch)
+                // requests, so the captured headers usually carry neither. Hotlink-protected
+                // CDNs then reject ExoPlayer's request with 403 — surfacing as playback error
+                // 2004 (ERROR_CODE_IO_BAD_HTTP_STATUS) even though a link was found. Fill in
+                // what a browser would send for a cross-origin media request: the embed page's
+                // origin. Anything the WebView did provide wins.
+                val outHeaders = c.headers.toMutableMap()
+                val pageOrigin = runCatching {
+                    URL(url).let { "${it.protocol}://${it.host}" }
+                }.getOrNull()
+                val referer = outHeaders.entries.firstOrNull { it.key.equals("Referer", true) }?.value
+                    ?: pageOrigin?.let { "$it/" } ?: url
+                if (outHeaders.keys.none { it.equals("Referer", true) }) {
+                    outHeaders["Referer"] = referer
+                }
+                if (pageOrigin != null && outHeaders.keys.none { it.equals("Origin", true) }) {
+                    outHeaders["Origin"] = pageOrigin
+                }
                 callback.invoke(
                     ExtractorLink(
                         source  = this@CstrspExtractor.name,
                         name    = this@CstrspExtractor.name,
                         url     = c.url,
-                        referer = c.headers["Referer"] ?: c.headers["referer"] ?: url,
+                        referer = referer,
                         quality = heightToQuality(c.maxHeight),
                         type    = ExtractorLinkType.M3U8,
-                        headers = c.headers
+                        headers = outHeaders
                     )
                 )
             }
