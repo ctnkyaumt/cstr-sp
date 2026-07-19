@@ -18,8 +18,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 
 private const val CACHE_TTL_MS = 30_000L
+// Upper bound on the whole mirror probe. A blocked mirror can hang until its connect
+// timeout (~20s each), which is long enough that home/search look broken.
+private const val DOMAIN_PROBE_TIMEOUT_MS = 6_000L
 private const val TRT_URL = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
 private const val TRT_POSTER =
     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
