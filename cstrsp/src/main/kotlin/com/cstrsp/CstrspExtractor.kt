@@ -180,15 +180,24 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
             // (ERROR_CODE_IO_BAD_HTTP_STATUS) even though a link was found. Fill in what a
             // browser sends for a cross-origin media request. Anything the WebView did
             // provide wins.
-            fun headersFor(c: Candidate): Pair<String, Map<String, String>> {
-                val out = c.headers.toMutableMap()
-                val ref = out.entries.firstOrNull { it.key.equals("Referer", true) }?.value
-                    ?: pageOrigin?.let { "$it/" } ?: url
-                if (out.keys.none { it.equals("Referer", true) }) out["Referer"] = ref
-                if (pageOrigin != null && out.keys.none { it.equals("Origin", true) }) {
-                    out["Origin"] = pageOrigin
+            // ...but the opposite CDN also exists: Amazon's aiv-cdn answers 400 when a Referer
+            // is present and 200 without one. So never assume — offer both variants and let
+            // the probe below keep whichever the CDN actually accepts.
+            fun headerVariants(c: Candidate): List<Pair<String, Map<String, String>>> {
+                val captured = c.headers.toMutableMap()
+                val capturedRef = captured.entries
+                    .firstOrNull { it.key.equals("Referer", true) }?.value
+                val ref = capturedRef ?: pageOrigin?.let { "$it/" } ?: url
+                val withOrigin = captured.toMutableMap().also { m ->
+                    if (m.keys.none { it.equals("Referer", true) }) m["Referer"] = ref
+                    if (pageOrigin != null && m.keys.none { it.equals("Origin", true) }) {
+                        m["Origin"] = pageOrigin
+                    }
                 }
-                return ref to out
+                val bare = captured.filterKeys {
+                    !it.equals("Referer", true) && !it.equals("Origin", true)
+                }
+                return listOf(ref to withOrigin, "" to bare)
             }
             // Preference order: confirmed master, then blind-captured, then a known variant;
             // earliest-requested first within each tier.
@@ -200,12 +209,15 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
             // Don't hand the player a URL the CDN refuses — that is exactly the 2004 the user
             // sees. Re-requesting a live HLS playlist is safe (every player polls them
             // continuously); media segments, which can be single-use, are never probed.
-            val chosen = withContext(Dispatchers.IO) {
-                ordered.firstOrNull { isServable(it.url, headersFor(it).second) }
-                    ?: ordered.firstOrNull()
+            val picked = withContext(Dispatchers.IO) {
+                ordered.firstNotNullOfOrNull { c ->
+                    headerVariants(c)
+                        .firstOrNull { (_, h) -> isServable(c.url, h) }
+                        ?.let { c to it }
+                } ?: ordered.firstOrNull()?.let { it to headerVariants(it).first() }
             }
-            chosen?.let { c ->
-                val (referer, outHeaders) = headersFor(c)
+            picked?.let { (c, variant) ->
+                val (referer, outHeaders) = variant
                 callback.invoke(
                     ExtractorLink(
                         source  = this@CstrspExtractor.name,

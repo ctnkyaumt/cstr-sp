@@ -1273,22 +1273,43 @@ class Cstrsp : MainAPI() {
                             }
                             return@resolveConcurrently
                         }
-                        // Many roxie raw feeds are geo-locked to the broadcaster's country —
-                        // the site labels them "VPN"/"PC ONLY" and the CDN answers 403
-                        // ("Not within permitted geographical region") or 400. Offering those
-                        // produced a link that always died with playback error 2004, so check
-                        // the manifest first and simply omit what the CDN refuses to serve. A
-                        // network error is inconclusive, so it stays eligible.
-                        val servable = try {
-                            app.get(
-                                manifest,
-                                referer = "$roxieUrl/",
-                                headers = mapOf("Origin" to roxieUrl)
-                            ).code !in 400..599
-                        } catch (e: Exception) {
-                            true
+                        // Which headers a feed wants differs per CDN and must not be assumed:
+                        // Amazon's aiv-cdn (the "PC ONLY" feeds) answers 400 when a Referer is
+                        // present and 200 without one, while hotlink-protected hosts need
+                        // exactly that Referer/Origin. So probe both and keep whichever the CDN
+                        // actually serves. When every variant is refused the feed is genuinely
+                        // geo-locked (403 "Not within permitted geographical region") and we
+                        // omit it rather than offer a link that dies with playback error 2004.
+                        val headerVariants = listOf(
+                            null to emptyMap<String, String>(),
+                            "$roxieUrl/" to mapOf("Origin" to roxieUrl)
+                        )
+                        var pickedRef: String? = null
+                        var pickedHeaders: Map<String, String> = emptyMap()
+                        var accepted = false
+                        var refused = false
+                        for ((ref, extra) in headerVariants) {
+                            val code = try {
+                                app.get(manifest, referer = ref, headers = extra).code
+                            } catch (e: Exception) {
+                                null // inconclusive, try the next variant
+                            }
+                            if (code == null) continue
+                            if (code !in 400..599) {
+                                pickedRef = ref
+                                pickedHeaders = extra
+                                accepted = true
+                                break
+                            }
+                            refused = true
                         }
-                        if (!servable) return@resolveConcurrently
+                        if (!accepted && refused) return@resolveConcurrently
+                        if (!accepted) {
+                            // Never got a definitive answer — offer it with the referer variant
+                            // rather than hide a stream that may well work.
+                            pickedRef = "$roxieUrl/"
+                            pickedHeaders = mapOf("Origin" to roxieUrl)
+                        }
                         val linkType =
                             if (manifest.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                         val keys = roxieClearKeyRegex.find(page)
@@ -1302,7 +1323,8 @@ class Cstrsp : MainAPI() {
                             ) {
                                 this.kid = keys.groupValues[1]
                                 this.key = keys.groupValues[2]
-                                this.referer = "$roxieUrl/"
+                                this.referer = pickedRef ?: ""
+                                this.headers = pickedHeaders
                             }
                         } else {
                             newExtractorLink(
@@ -1311,7 +1333,8 @@ class Cstrsp : MainAPI() {
                                 url = manifest,
                                 type = linkType
                             ) {
-                                this.referer = "$roxieUrl/"
+                                this.referer = pickedRef ?: ""
+                                this.headers = pickedHeaders
                             }
                         }
                         callback(link)
