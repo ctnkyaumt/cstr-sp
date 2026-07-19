@@ -180,24 +180,15 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
             // (ERROR_CODE_IO_BAD_HTTP_STATUS) even though a link was found. Fill in what a
             // browser sends for a cross-origin media request. Anything the WebView did
             // provide wins.
-            // ...but the opposite CDN also exists: Amazon's aiv-cdn answers 400 when a Referer
-            // is present and 200 without one. So never assume — offer both variants and let
-            // the probe below keep whichever the CDN actually accepts.
-            fun headerVariants(c: Candidate): List<Pair<String, Map<String, String>>> {
-                val captured = c.headers.toMutableMap()
-                val capturedRef = captured.entries
-                    .firstOrNull { it.key.equals("Referer", true) }?.value
-                val ref = capturedRef ?: pageOrigin?.let { "$it/" } ?: url
-                val withOrigin = captured.toMutableMap().also { m ->
-                    if (m.keys.none { it.equals("Referer", true) }) m["Referer"] = ref
-                    if (pageOrigin != null && m.keys.none { it.equals("Origin", true) }) {
-                        m["Origin"] = pageOrigin
-                    }
+            fun headersFor(c: Candidate): Pair<String, Map<String, String>> {
+                val out = c.headers.toMutableMap()
+                val ref = out.entries.firstOrNull { it.key.equals("Referer", true) }?.value
+                    ?: pageOrigin?.let { "$it/" } ?: url
+                if (out.keys.none { it.equals("Referer", true) }) out["Referer"] = ref
+                if (pageOrigin != null && out.keys.none { it.equals("Origin", true) }) {
+                    out["Origin"] = pageOrigin
                 }
-                val bare = captured.filterKeys {
-                    !it.equals("Referer", true) && !it.equals("Origin", true)
-                }
-                return listOf(ref to withOrigin, "" to bare)
+                return ref to out
             }
             // Preference order: confirmed master, then blind-captured, then a known variant;
             // earliest-requested first within each tier.
@@ -206,22 +197,13 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     candidates.filter { it.isMaster == null }.sortedBy { it.seq } +
                     candidates.filter { it.isMaster == false }.sortedBy { it.seq }
                 ).distinctBy { it.url }
-                // Bounded: each probe costs a round-trip and up to two header variants are
-                // tried per candidate, so an unbounded list would leave the user staring at a
-                // spinner. The best candidates are already first.
-                .take(3)
-            // Don't hand the player a URL the CDN refuses — that is exactly the 2004 the user
-            // sees. Re-requesting a live HLS playlist is safe (every player polls them
-            // continuously); media segments, which can be single-use, are never probed.
-            val picked = withContext(Dispatchers.IO) {
-                ordered.firstNotNullOfOrNull { c ->
-                    headerVariants(c)
-                        .firstOrNull { (_, h) -> isServable(c.url, h) }
-                        ?.let { c to it }
-                } ?: ordered.firstOrNull()?.let { it to headerVariants(it).first() }
-            }
-            picked?.let { (c, variant) ->
-                val (referer, outHeaders) = variant
+            // Deliberately NOT probed. These playlist URLs are frequently single-use: fetching
+            // one here consumes its token, so the player's own request then fails with 403 —
+            // which showed up as *every* PPV link erroring with 2004. Blind capture is the
+            // whole reason the URL stays valid for playback. (Roxie is different and is
+            // verified in the provider, since those manifests are ordinary re-fetchable ones.)
+            ordered.firstOrNull()?.let { c ->
+                val (referer, outHeaders) = headersFor(c)
                 callback.invoke(
                     ExtractorLink(
                         source  = this@CstrspExtractor.name,
@@ -308,24 +290,6 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
             ".woff", ".woff2", ".ttf", ".otf", ".ts", ".m4s", ".mp4", ".webm",
             ".mp3", ".aac", ".wasm", ".map"
         )
-
-        // True unless the server explicitly rejects the request. Only the status line is read
-        // — the body is never consumed — and any network/TLS error counts as inconclusive so
-        // a flaky probe can never hide a working stream.
-        private fun isServable(target: String, headers: Map<String, String>): Boolean = try {
-            val conn = (URL(target).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 2500
-                readTimeout = 2500
-                instanceFollowRedirects = true
-            }
-            headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-            val code = conn.responseCode
-            conn.disconnect()
-            code !in 400..599
-        } catch (e: Exception) {
-            true
-        }
 
         // Checked against the path only, so query strings ("logo.png?v=2") can't dodge it.
         private fun isStaticAsset(url: String): Boolean {
