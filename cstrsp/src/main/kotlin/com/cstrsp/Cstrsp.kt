@@ -479,6 +479,22 @@ class Cstrsp : MainAPI() {
         return true
     }
 
+    // Percent-encodes only the non-ASCII bytes of a URL, leaving ASCII (including any
+    // existing %XX escapes and reserved chars) untouched. Some upstreams embed raw UTF-8 in
+    // the path — e.g. PPV's "Türkiye vs. Iran" yields .../mensvnl/2026-07-19/tür-ira, whose
+    // bare "ü" is an invalid URL that the WebView extractor fails to load ("no links found").
+    // UTF-8 is ASCII-transparent, so encoding byte-by-byte can't corrupt the valid parts.
+    private fun encodeUrlNonAscii(url: String): String {
+        if (url.all { it.code <= 0x7F }) return url
+        val sb = StringBuilder(url.length + 16)
+        for (b in url.toByteArray(Charsets.UTF_8)) {
+            val v = b.toInt() and 0xFF
+            if (v <= 0x7F) sb.append(v.toChar())
+            else sb.append('%').append("%02X".format(v))
+        }
+        return sb.toString()
+    }
+
     private fun streamedPoster(match: APIMatch): String? = when {
         match.poster != null -> "$mainUrl${match.poster}"
         match.teams?.home?.badge != null -> "$apiUrl/images/badge/${match.teams.home.badge}.webp"
@@ -727,6 +743,7 @@ class Cstrsp : MainAPI() {
     private inner class QueryMatcher(query: String) {
         private val q: String
         private val wholeQueryAliases: Set<String>?
+        private val embeddedAliasGroups: List<Set<String>>
         private val tokenVariants: List<Set<String>>
 
         init {
@@ -734,6 +751,15 @@ class Cstrsp : MainAPI() {
             trPhraseNames.forEach { (tr, en) -> s = s.replace(tr, en) }
             q = s.replace(nonAlnumRegex, " ").trim()
             wholeQueryAliases = synonymIndex[q]
+            // Multi-word aliases embedded in a longer query. Upstreams often label an event
+            // by its series/competition ("Formula 1", not "Belgian Grand Prix"), so a query
+            // like "belgian grand prix" — which contains the "grand prix" alias — should
+            // still find the "Formula 1" card. Matched on token boundaries so "grand prix"
+            // hits "belgian grand prix race" but not a substring like "grandprixx".
+            val padded = " $q "
+            embeddedAliasGroups = synonymIndex
+                .filterKeys { it.contains(' ') && padded.contains(" $it ") }
+                .values.toList()
             tokenVariants = q.split(" ").filter { it.isNotBlank() }
                 .map { part -> searchVariants(part) + (synonymIndex[part] ?: emptySet()) }
         }
@@ -746,6 +772,9 @@ class Cstrsp : MainAPI() {
             val hay = normalizeText(fields.filterNotNull().joinToString(" "))
             // Whole-query alias: lets multi-word aliases match without being split into tokens.
             wholeQueryAliases?.let { group -> if (group.any { hay.contains(it) }) return true }
+            // Embedded competition/series alias: a query naming a competition surfaces that
+            // competition's events even when they carry only the series name.
+            embeddedAliasGroups.forEach { group -> if (group.any { hay.contains(it) }) return true }
             if (tokenVariants.isEmpty()) return true
             return tokenVariants.all { variants -> variants.any { hay.contains(it) } }
         }
@@ -1068,7 +1097,7 @@ class Cstrsp : MainAPI() {
                 }
 
                 iframes.resolveConcurrently { (name, iframeUrl) ->
-                    loadExtractor(iframeUrl, "https://embedindia.st/", subtitleCallback) { link ->
+                    loadExtractor(encodeUrlNonAscii(iframeUrl), "https://embedindia.st/", subtitleCallback) { link ->
                         callback(
                             ExtractorLink(
                                 source = "PPV",
@@ -1103,7 +1132,7 @@ class Cstrsp : MainAPI() {
                     // from the *detected* quality below, not from WF's static quality hint
                     // (which is what was mislabeling 1080p feeds as 720p).
                     val base = listOfNotNull(stream.source, stream.language).joinToString(" - ").ifBlank { "Live" }
-                    loadExtractor(stream.url!!, "https://api.watchfooty.st/", subtitleCallback) { link ->
+                    loadExtractor(encodeUrlNonAscii(stream.url!!), "https://api.watchfooty.st/", subtitleCallback) { link ->
                         var resolvedQuality = if (link.quality != Qualities.Unknown.value) link.quality else wfQuality(stream.quality)
                         val nameLower = link.name.lowercase()
                         val urlLower = link.url.lowercase()
@@ -1233,7 +1262,7 @@ class Cstrsp : MainAPI() {
             val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
             val base = "$sourceName - $langStr - Stream ${stream.streamNo}"
             // Pass the embed URL to our WebView extractor (or built-in extractors)
-            loadExtractor(stream.embedUrl, "$mainUrl/", subtitleCallback) { link ->
+            loadExtractor(encodeUrlNonAscii(stream.embedUrl), "$mainUrl/", subtitleCallback) { link ->
                 // Trust the extractor's detected resolution (from the master playlist).
                 // When it can't be determined we leave it Unknown rather than guessing
                 // 720p, so we never label a stream with a resolution we didn't measure.
