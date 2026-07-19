@@ -1243,16 +1243,21 @@ class Cstrsp : MainAPI() {
                 val eventRef = "$roxieUrl${load.path}"
                 load.sources.resolveConcurrently { src ->
                     if (src.kind == "raw") {
+                        // playIframePlayer() takes either a site-relative path ('/raw/ctv') or a
+                        // full off-site URL ('https://….pages.dev/play/…'); blindly prefixing
+                        // roxieUrl turned the latter into a malformed URL that never loaded.
+                        val rawUrl =
+                            if (src.value.startsWith("http")) src.value else "$roxieUrl${src.value}"
                         // The /raw/ player page is plain Shaka JS holding a DASH manifest and
                         // ClearKey pairs. The WebView sniffer only ever captures HLS (".m3u"
                         // URLs / "#EXTM" bodies), so it always came up empty here — hence
                         // "no links found". Parse the page directly instead.
-                        val page = app.get("$roxieUrl${src.value}", referer = eventRef).text
+                        val page = app.get(rawUrl, referer = eventRef).text
                         val manifest = roxieLoadCallRegex.find(page)?.groupValues?.get(1)
                             ?: roxieManifestRegex.find(page)?.value
                         if (manifest == null) {
                             // Not a Shaka page — fall back to the WebView sniffer.
-                            loadExtractor("$roxieUrl${src.value}", eventRef, subtitleCallback) { link ->
+                            loadExtractor(rawUrl, eventRef, subtitleCallback) { link ->
                                 callback(
                                     ExtractorLink(
                                         source = "Roxie",
@@ -1268,6 +1273,22 @@ class Cstrsp : MainAPI() {
                             }
                             return@resolveConcurrently
                         }
+                        // Many roxie raw feeds are geo-locked to the broadcaster's country —
+                        // the site labels them "VPN"/"PC ONLY" and the CDN answers 403
+                        // ("Not within permitted geographical region") or 400. Offering those
+                        // produced a link that always died with playback error 2004, so check
+                        // the manifest first and simply omit what the CDN refuses to serve. A
+                        // network error is inconclusive, so it stays eligible.
+                        val servable = try {
+                            app.get(
+                                manifest,
+                                referer = "$roxieUrl/",
+                                headers = mapOf("Origin" to roxieUrl)
+                            ).code !in 400..599
+                        } catch (e: Exception) {
+                            true
+                        }
+                        if (!servable) return@resolveConcurrently
                         val linkType =
                             if (manifest.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                         val keys = roxieClearKeyRegex.find(page)
