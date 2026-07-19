@@ -444,6 +444,20 @@ class Cstrsp : MainAPI() {
         iframeSrcRegex.find(html)?.groupValues?.get(1)?.takeIf { it.startsWith("http") }
     } ?: url
 
+    // The roxie CDN pool sits behind Cloudflare, which rejects a plain request with 403 even
+    // when Referer/Origin are correct — every m3u8 button silently disappeared as a result.
+    // It passes once the request also looks like a browser fetch: the Sec-Fetch-* trio is the
+    // deciding factor (Accept/Accept-Language/sec-ch-ua make no difference, verified by
+    // bisecting against the live hosts). Sent both when probing and during playback, since
+    // the player's own requests have to clear the same check.
+    private val roxieCdnHeaders = mapOf(
+        "Referer" to "$roxieUrl/",
+        "Origin" to roxieUrl,
+        "Sec-Fetch-Dest" to "empty",
+        "Sec-Fetch-Mode" to "cors",
+        "Sec-Fetch-Site" to "cross-site"
+    )
+
     // The homepage "Upcoming Events" table, one card per row. Cached; shared by home/search/load.
     private suspend fun fetchRoxieEvents(): List<RoxieEvent> = cached("roxie-events") {
         val html = app.get("$roxieUrl/", referer = "$roxieUrl/").text
@@ -486,7 +500,7 @@ class Cstrsp : MainAPI() {
         for (domain in (listOfNotNull(roxieGoodDomain) + domains).distinct()) {
             val url = "https://${source.subdomain}.$domain/${source.value}"
             try {
-                val res = app.get(url, referer = "$roxieUrl/", headers = mapOf("Origin" to roxieUrl))
+                val res = app.get(url, referer = "$roxieUrl/", headers = roxieCdnHeaders)
                 if (res.code == 200 && res.text.trimStart().startsWith("#EXTM")) {
                     roxieGoodDomain = domain
                     return url
@@ -1359,7 +1373,8 @@ class Cstrsp : MainAPI() {
                         // omit it rather than offer a link that dies with playback error 2004.
                         val headerVariants = listOf(
                             null to emptyMap<String, String>(),
-                            "$roxieUrl/" to mapOf("Origin" to roxieUrl)
+                            "$roxieUrl/" to mapOf("Origin" to roxieUrl),
+                            "$roxieUrl/" to roxieCdnHeaders // Cloudflare-fronted hosts
                         )
                         var pickedRef: String? = null
                         var pickedHeaders: Map<String, String> = emptyMap()
@@ -1428,7 +1443,7 @@ class Cstrsp : MainAPI() {
                                 referer = "$roxieUrl/",
                                 quality = Qualities.Unknown.value,
                                 type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8,
-                                headers = mapOf("Referer" to "$roxieUrl/", "Origin" to roxieUrl)
+                                headers = roxieCdnHeaders
                             )
                         )
                     }
