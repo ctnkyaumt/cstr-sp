@@ -881,12 +881,23 @@ class Cstrsp : MainAPI() {
         return results
     }
 
-    // Streamed.pk — live only. /matches/all-today also returns not-yet-started matches,
-    // which we deliberately keep out of search results (only /matches/live).
-    private suspend fun searchStreamed(matcher: QueryMatcher): List<SearchResponse> =
-        fetchMatches("$apiUrl/matches/live")
-            .distinctBy { it.id }
-            .filter { it.title != null && matcher.matches(it.title, it.category) }
+    // Streamed.pk search. Home uses /matches/live only, but Streamed's live flag is
+    // unreliable: some genuinely-live events (an F1 race, e.g. the Belgian GP) never appear
+    // in /live and only exist in /all-today, sometimes with a stale/null start time. So for
+    // search we union both and dedupe (live entries win), dropping only entries that are
+    // clearly in the future (tomorrow's schedule) — a null/past date is kept, so an event
+    // with broken metadata is still findable rather than silently missing.
+    private suspend fun searchStreamed(matcher: QueryMatcher): List<SearchResponse> {
+        val live = fetchMatches("$apiUrl/matches/live")
+        val futureCutoff = System.currentTimeMillis() + 12 * 3_600_000L
+        val allToday = fetchMatches("$apiUrl/matches/all-today")
+            .filter { it.date == null || it.date < futureCutoff }
+        val seen = HashSet<String>()
+        return (live + allToday)
+            .filter { m ->
+                m.id != null && m.title != null && seen.add(m.id) &&
+                    matcher.matches(m.title, m.category)
+            }
             .mapNotNull { match ->
                 val id = match.id ?: return@mapNotNull null
                 val title = match.title ?: return@mapNotNull null
@@ -894,6 +905,7 @@ class Cstrsp : MainAPI() {
                     this.posterUrl = streamedPoster(match)
                 }
             }
+    }
 
     private suspend fun searchPpv(matcher: QueryMatcher): List<SearchResponse> =
         fetchPPVApi()?.streams.orEmpty().flatMap { category ->
