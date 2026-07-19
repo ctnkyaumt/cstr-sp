@@ -70,32 +70,42 @@ class Cstrsp : MainAPI() {
         cacheMutex.withLock { apiCache[key] = System.currentTimeMillis() to value }
     }
 
+    // Every entry point (home, search, load, loadLinks) awaits this first, so it must never
+    // stall the UI: unreachable mirrors can hang ~20s each on a connect timeout, which is
+    // long enough that a search looks completely broken. The whole probe is therefore capped,
+    // and on expiry we just keep the default domain — a later per-call fetch retries anyway.
     private suspend fun checkAndGetDomain() {
         if (isDomainChecked) return
-        for (domain in domains) {
-            try {
-                val response = app.get("$domain/api/matches/live")
-                // Accept a mirror only when its body actually parses to matches. A
-                // DNS-blocked/hijacked mirror can answer 200 with a stub page (some ISPs
-                // return a placeholder instead of NXDOMAIN), which a status-only check would
-                // accept — pinning us to a dead host so the whole Streamed source silently
-                // vanishes. Requiring real data lets us fall through to the next mirror.
-                val parsed = response.parsedSafe<Array<APIMatch>>()?.toList()
-                    ?.filter { it.id != null && it.title != null }
-                if (response.code in 200..299 && !parsed.isNullOrEmpty()) {
-                    mainUrl = domain
-                    apiUrl = "$domain/api"
-                    isDomainChecked = true
-                    // The probe body IS the live-matches list; seed the cache so the
-                    // fetch that immediately follows doesn't repeat the same request.
-                    putCache("$apiUrl/matches/live", parsed)
-                    return
-                }
-            } catch (e: Exception) {}
+        withTimeoutOrNull(DOMAIN_PROBE_TIMEOUT_MS) {
+            for (domain in domains) {
+                try {
+                    val response = app.get("$domain/api/matches/live")
+                    // Accept a mirror when its body actually parses as the match array. A
+                    // DNS-blocked/hijacked mirror can answer 200 with a stub page (some ISPs
+                    // return a placeholder instead of NXDOMAIN), which a status-only check
+                    // would accept — pinning us to a dead host so the whole Streamed source
+                    // silently vanishes. An EMPTY array is still a healthy mirror (a lull with
+                    // nothing live), so it must not be rejected: doing so sent us on to the
+                    // dead mirrors and burned the timeout budget on every call.
+                    val parsed = response.parsedSafe<Array<APIMatch>>()?.toList()
+                        ?.filter { it.id != null && it.title != null }
+                    if (response.code in 200..299 && parsed != null) {
+                        mainUrl = domain
+                        apiUrl = "$domain/api"
+                        isDomainChecked = true
+                        // The probe body IS the live-matches list; seed the cache so the
+                        // fetch that immediately follows doesn't repeat the same request.
+                        putCache("$apiUrl/matches/live", parsed)
+                        return@withTimeoutOrNull
+                    }
+                } catch (e: Exception) {}
+            }
         }
-        mainUrl = domains.first()
-        apiUrl = "${domains.first()}/api"
-        isDomainChecked = true
+        if (!isDomainChecked) {
+            mainUrl = domains.first()
+            apiUrl = "${domains.first()}/api"
+            isDomainChecked = true
+        }
     }
 
     data class APIMatch(
@@ -348,6 +358,75 @@ class Cstrsp : MainAPI() {
     private val roxieManifestRegex = Regex("https?://[^\\s\"'<>]+\\.(?:mpd|m3u8)[^\\s\"'<>]*")
     private val roxieClearKeyRegex =
         Regex("[\"']([0-9a-fA-F]{32})[\"']\\s*:\\s*[\"']([0-9a-fA-F]{32})[\"']")
+    // A button can also call a wrapper, e.g. onclick="playTsnRandom()", whose body holds the
+    // real calls (roxie's TSN button randomly picks between an embed and an m3u8). Without
+    // resolving that indirection the button is silently dropped and the feed never appears.
+    private val roxieFnCallRegex = Regex("^\\s*([A-Za-z_$][\\w$]*)\\s*\\(\\s*\\)\\s*;?\\s*$")
+
+    // Body of `function <name>(...) { ... }`, brace-matched so it can't bleed into the next
+    // function. Null when the function isn't defined in this page.
+    private fun jsFunctionBody(html: String, name: String): String? {
+        val head = Regex("function\\s+${Regex.escape(name)}\\s*\\([^)]*\\)\\s*\\{").find(html)
+            ?: return null
+        var depth = 0
+        var i = head.range.last // index of the opening brace
+        val start = i + 1
+        while (i < html.length) {
+            when (html[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return html.substring(start, i)
+                }
+            }
+            i++
+            if (i - start > 4000) break // runaway guard
+        }
+        return null
+    }
+
+    // Every playable source a button's onclick yields. A wrapper is followed exactly one
+    // level deep, which is enough for the shapes roxie uses and keeps recursion bounded.
+    private fun roxieSourcesFrom(
+        onclick: String,
+        label: String,
+        html: String,
+        nested: Boolean = false
+    ): List<RoxieSource> {
+        val out = mutableListOf<RoxieSource>()
+        roxieGetStreamRegex.findAll(onclick).forEach {
+            out.add(RoxieSource(label, "m3u8", it.groupValues[1], it.groupValues[2].ifBlank { "ataide0" }))
+        }
+        roxieRawRegex.findAll(onclick).forEach {
+            out.add(RoxieSource(label, "raw", it.groupValues[1]))
+        }
+        if (out.isEmpty() && !nested) {
+            roxieFnCallRegex.find(onclick)?.groupValues?.get(1)?.let { fn ->
+                jsFunctionBody(html, fn)?.let { body ->
+                    out.addAll(roxieSourcesFrom(body, label, html, nested = true))
+                }
+            }
+        }
+        return out
+    }
+
+    // CloudStream's DrmExtractorLink wants Base64 (JWK "oct") kid/key, but roxie's Shaka
+    // config lists them as 32-char hex — passing the hex straight through made the player
+    // fail with DRM error 6006 (ERROR_CODE_DRM_SYSTEM_ERROR).
+    private fun hexToBase64Url(hex: String): String? {
+        if (hex.length % 2 != 0) return null
+        val bytes = ByteArray(hex.length / 2)
+        for (i in bytes.indices) {
+            val hi = Character.digit(hex[i * 2], 16)
+            val lo = Character.digit(hex[i * 2 + 1], 16)
+            if (hi < 0 || lo < 0) return null
+            bytes[i] = ((hi shl 4) or lo).toByte()
+        }
+        return android.util.Base64.encodeToString(
+            bytes,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
+        )
+    }
 
     // WF's sportsembed.su page is only an ad wrapper — the real player sits in a nested
     // iframe (embedindia.st, the same host PPV uses successfully). The WebView sniffer gets
@@ -387,17 +466,11 @@ class Cstrsp : MainAPI() {
     // uses for direct m3u8 hosts. Both come from the same fetch, so we grab them together.
     private suspend fun fetchRoxiePage(path: String): RoxiePage = cached("roxie-page-$path") {
         val html = app.get("$roxieUrl$path", referer = "$roxieUrl/").text
-        val sources = roxieButtonRegex.findAll(html).mapNotNull { m ->
+        val sources = roxieButtonRegex.findAll(html).flatMap { m ->
             val onclick = m.groupValues[1]
             val label = roxieTagRegex.replace(m.groupValues[2], "").trim().ifBlank { "Stream" }
-            roxieGetStreamRegex.find(onclick)?.let {
-                return@mapNotNull RoxieSource(label, "m3u8", it.groupValues[1], it.groupValues[2].ifBlank { "ataide0" })
-            }
-            roxieRawRegex.find(onclick)?.let {
-                return@mapNotNull RoxieSource(label, "raw", it.groupValues[1])
-            }
-            null
-        }.toList()
+            roxieSourcesFrom(onclick, label, html).asSequence()
+        }.distinctBy { "${it.kind}|${it.value}|${it.subdomain}" }.toList()
         val domainsFile = roxieDomainsFileRegex.find(html)?.value ?: "domainsz58.txt"
         RoxiePage(sources, domainsFile).takeIf { sources.isNotEmpty() }
     } ?: RoxiePage(emptyList(), "domainsz58.txt")
@@ -1313,7 +1386,9 @@ class Cstrsp : MainAPI() {
                         val linkType =
                             if (manifest.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                         val keys = roxieClearKeyRegex.find(page)
-                        val link = if (keys != null) {
+                        val kidB64 = keys?.let { hexToBase64Url(it.groupValues[1]) }
+                        val keyB64 = keys?.let { hexToBase64Url(it.groupValues[2]) }
+                        val link = if (kidB64 != null && keyB64 != null) {
                             newDrmExtractorLink(
                                 source = "Roxie",
                                 name = "Roxie - ${src.label}",
@@ -1321,8 +1396,8 @@ class Cstrsp : MainAPI() {
                                 type = linkType,
                                 uuid = CLEARKEY_UUID
                             ) {
-                                this.kid = keys.groupValues[1]
-                                this.key = keys.groupValues[2]
+                                this.kid = kidB64
+                                this.key = keyB64
                                 this.referer = pickedRef ?: ""
                                 this.headers = pickedHeaders
                             }
