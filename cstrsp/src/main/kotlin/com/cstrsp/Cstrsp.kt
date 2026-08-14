@@ -598,7 +598,7 @@ class Cstrsp : MainAPI() {
                 }
             }.awaitAll().filterNotNull()
         }
-    }
+    } ?: emptyList()
 
     // Resolves an m3u8 source to a playable playlist url, or null. Tries the last-known-good
     // domain first, then the rest, accepting the first that returns a real HLS playlist —
