@@ -1,5 +1,7 @@
 import json
+import base64
 import urllib.request
+import urllib.parse
 import ssl
 import re
 import time
@@ -51,22 +53,35 @@ def hdr(title):
 # --- Streamed (streamed.pk) — mirrors Cstrsp.checkAndGetDomain / fetchMatches ---------
 def test_streamed():
     hdr("TESTING STREAMED (streamed.pk)")
-    domains = ["https://streamed.pk", "https://streamed.st"]
-    matches = None
+    domains = ["https://streamed.pk", "https://streamed.st", "https://streamed.su", "https://streami.su"]
+    healthy = []
     for d in domains:
-        matches = get_json(f"{d}/api/matches/live")
-        if matches:
-            print(f"Success fetching from {d}!")
-            break
-    if not matches:
-        print("Failed to fetch live Streamed matches.")
+        result = get_json(f"{d}/api/matches/live")
+        # An empty array is a healthy mirror during a live-event lull.
+        if isinstance(result, list):
+            healthy.append((d, result))
+            print(f"Healthy mirror: {d} ({len(result)} live matches)")
+    if not healthy:
+        print("Failed to fetch a valid match array from every Streamed mirror.")
         return
+    domain, matches = healthy[0]
     # Kotlin keeps only entries with id + title.
     matches = [m for m in matches if m.get("id") and m.get("title")]
     print(f"Found {len(matches)} live matches.")
     for match in matches[:3]:
         sources = match.get("sources", [])
         print(f"- Match: '{match.get('title')}' with sources: {[s.get('source') for s in sources]}")
+
+    sample = next((m for m in matches if m.get("sources")), None)
+    if sample:
+        source = sample["sources"][0]
+        streams = get_json(f"{domain}/api/stream/{source.get('source')}/{source.get('id')}")
+        valid = [s for s in (streams or []) if s.get("embedUrl")]
+        print(f"Representative stream endpoint returned {len(valid)} embeds.")
+        if valid:
+            page = get_text(valid[0]["embedUrl"], referer=domain + "/") or ""
+            player_shell = '<div id="player"' in page
+            print(f"Player shell: {'healthy' if player_shell else 'unexpected'} ({len(page)} bytes)")
 
 
 # --- PPV — mirrors fetchPPVApi + isLivePpv -------------------------------------------
@@ -85,7 +100,7 @@ def _ppv_is_live(cat, stream):
 
 def test_ppv():
     hdr("TESTING PPV")
-    ppv_domains = ["api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx"]
+    ppv_domains = ["api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx", "api.ppv.to"]
     res = None
     for domain in ppv_domains:
         res = get_json(f"https://{domain}/api/streams")
@@ -106,6 +121,13 @@ def test_ppv():
             iframe = (s.get('iframe') or '')[:60] or 'None'
             print(f"  * {s.get('name')} | iframe: {iframe}...")
 
+    sample = next((s for c in categories for s in (c.get("streams") or [])
+                   if _ppv_is_live(c, s) and s.get("iframe")), None)
+    if sample:
+        page = get_text(sample["iframe"], referer="https://embedindia.st/") or ""
+        player_shell = 'id="player"' in page and "bundle-jw.js" in page
+        print(f"Representative EmbedIndia player shell: {'healthy' if player_shell else 'unexpected'} ({len(page)} bytes)")
+
 
 # --- WatchFooty — mirrors fetchWFMatches + wfListable (status 'in' + non-SD stream) ---
 def _wf_has_hd(match):
@@ -115,6 +137,9 @@ def _wf_has_hd(match):
 
 def _wf_is_live(match):
     return (match.get("status") or "").strip().lower() in ("in", "live")
+
+
+_IFRAME_SRC = re.compile(r'<iframe[^>]+src\s*=\s*["\']([^"\']+)["\']', re.I)
 
 
 def test_wf():
@@ -131,6 +156,22 @@ def test_wf():
         for s in streams[:2]:
             print(f"  * {s.get('source')} | {s.get('language')} | {s.get('quality')}")
 
+    if listable:
+        stream = next((s for s in (listable[0].get("streams") or [])
+                       if s.get("url") and (s.get("quality") or "").upper() != "SD"), None)
+        if stream:
+            wrapper = get_text(stream["url"], referer="https://api.watchfooty.st/") or ""
+            match = _IFRAME_SRC.search(wrapper)
+            inner = urllib.parse.urljoin(stream["url"], match.group(1).replace("&amp;", "&")) if match else None
+            inner_page = get_text(inner, referer=stream["url"]) if inner else None
+            player_shell = bool(
+                (inner_page and 'id="player"' in inner_page)
+                or 'id="video_player"' in wrapper
+                or 'id="player"' in wrapper
+            )
+            print(f"Player route: {inner or stream['url']}")
+            print(f"Player shell: {'healthy' if player_shell else 'unexpected'}")
+
 
 # --- StreamSports (cdnlivetv.tv) — mirrors fetchCdnEvents + isLiveCdn + prune ---------
 CDN_NOT_LIVE = {
@@ -138,6 +179,33 @@ CDN_NOT_LIVE = {
     "abd", "abandoned", "susp", "suspended", "wo", "awd", "ft", "aet", "pen",
     "fin", "finished", "ended",
 }
+
+_PLAYER_SOURCE = re.compile(r'<source[^>]+src\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']', re.I | re.S)
+_PLAYER_SOURCE_VAR = re.compile(r'source\s*:\s*\{\s*src\s*:\s*([A-Za-z_$][\w$]*)', re.I)
+_JS_STRING_VAR = re.compile(r"var\s+([A-Za-z_$][\w$]*)\s*=\s*'([A-Za-z0-9_-]+)'\s*;")
+
+
+def _decode_player_source(page, player_url):
+    source = _PLAYER_SOURCE.search(page)
+    if source:
+        return urllib.parse.urljoin(player_url, source.group(1).replace("&amp;", "&"))
+
+    source_var = _PLAYER_SOURCE_VAR.search(page)
+    if not source_var:
+        return None
+    values = dict(_JS_STRING_VAR.findall(page))
+    expression = re.search(rf"var\s+{re.escape(source_var.group(1))}\s*=\s*([^;]+);", page)
+    if not expression:
+        return None
+    refs = re.findall(r"\(([A-Za-z_$][\w$]*)\)", expression.group(1))
+    try:
+        pieces = []
+        for ref in refs:
+            encoded = values[ref]
+            pieces.append(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+        return "".join(pieces)
+    except (KeyError, ValueError, UnicodeDecodeError):
+        return None
 
 
 def _cdn_is_live(ev):
@@ -172,9 +240,26 @@ def test_cdn():
         chans = [c.get("channel_name") for c in (e.get("channels") or []) if c.get("url")]
         print(f"- [{sport}] '{title}' channels: {chans[:3]}")
 
+    if sample:
+        channel = next(c for c in (sample[0][1].get("channels") or []) if c.get("url"))
+        player = get_text(channel["url"], referer="https://cdnlivetv.tv/") or ""
+        playlist_url = _decode_player_source(player, channel["url"])
+        playlist = get_text(playlist_url, referer="https://cdnlivetv.tv/") if playlist_url else None
+        print(f"Signed HLS playlist: {'healthy' if playlist and playlist.lstrip().startswith('#EXTM') else 'failed'}")
+
 
 # --- Roxie (roxiestreams.su) — mirrors fetchRoxieEvents + fetchRoxieSources -----------
 _ROW = re.compile(r'href="(/[^"]+)"[^>]*>([^<]+)</a>')
+_ROXIE_STREAM = re.compile(r"getRandomStream\(\s*'([^']+)'(?:\s*,\s*'([^']+)')?")
+_ROXIE_DOMAINS = re.compile(r'domainsz\d+\.txt')
+
+
+def _is_hls(url, referer=None, timeout=5):
+    try:
+        _, body = _fetch(url, referer=referer, timeout=timeout)
+        return body.lstrip().startswith("#EXTM")
+    except Exception:
+        return False
 
 
 def test_roxie():
@@ -193,12 +278,43 @@ def test_roxie():
             seen.add(path)
             events.append((path, name.strip()))
     print(f"Found {len(rows)} rows, {len(events)} distinct event pages.")
+    browser_headers = {
+        "Origin": base,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+    }
+    old_headers = headers.copy()
+    headers.update(browser_headers)
     for path, name in events[:4]:
         page = get_text(base + path, referer=base + "/") or ""
         btns = re.findall(r'<button[^>]*onclick="([^"]*)"[^>]*>(.*?)</button>', page, re.S)
         m3u8 = sum(1 for h, _ in btns if "getRandomStream" in h)
         raw = sum(1 for h, _ in btns if "playIframePlayer" in h)
-        print(f"- {name} ({path}): {m3u8} m3u8 + {raw} raw sources")
+        sources = _ROXIE_STREAM.findall(page)
+        domains_match = _ROXIE_DOMAINS.search(page)
+        domains = []
+        if domains_match:
+            domains_text = get_text(base + "/" + domains_match.group(0), referer=base + "/") or ""
+            domains = list(dict.fromkeys(domains_text.split()))
+        working = []
+        for stream_path, subdomain in sources:
+            for domain in domains:
+                url = f"https://{subdomain or 'ataide0'}.{domain}/{stream_path}"
+                if _is_hls(url, referer=base + "/"):
+                    working.append(url)
+                    break
+        print(f"- {name} ({path}): {m3u8} button m3u8 + {raw} raw; {len(working)} direct HLS working")
+    headers.clear()
+    headers.update(old_headers)
+
+
+def test_trt():
+    hdr("TESTING TRT")
+    url = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
+    body = get_text(url, timeout=15)
+    variants = len(re.findall(r"#EXT-X-STREAM-INF", body or ""))
+    print(f"TRT master playlist: {'healthy' if body and body.lstrip().startswith('#EXTM') else 'failed'} ({variants} variants)")
 
 
 if __name__ == "__main__":
@@ -207,3 +323,4 @@ if __name__ == "__main__":
     test_wf()
     test_cdn()
     test_roxie()
+    test_trt()

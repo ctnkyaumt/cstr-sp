@@ -86,7 +86,18 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     // itself initiates afterwards.
                     override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                         val scheme = request?.url?.scheme?.lowercase()
-                        return scheme != null && scheme != "http" && scheme != "https"
+                        if (scheme != null && scheme != "http" && scheme != "https") return true
+
+                        // Player/ad scripts regularly replace the top frame with /ad.html,
+                        // about:blank, data: payloads, or an off-site ad before HLS is requested.
+                        // Subframe navigation remains allowed; only keep the original player in
+                        // control of the WebView's main frame (fragment changes are harmless).
+                        if (request?.isForMainFrame == true) {
+                            val requested = request.url.toString().substringBefore('#')
+                            val initial = url.substringBefore('#')
+                            if (requested != initial) return true
+                        }
+                        return false
                     }
 
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {

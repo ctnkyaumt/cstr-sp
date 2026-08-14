@@ -14,6 +14,8 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -24,6 +26,7 @@ private const val CACHE_TTL_MS = 30_000L
 // Upper bound on the whole mirror probe. A blocked mirror can hang until its connect
 // timeout (~20s each), which is long enough that home/search look broken.
 private const val DOMAIN_PROBE_TIMEOUT_MS = 6_000L
+private const val ROXIE_LIST_PROBE_TIMEOUT_MS = 5_000L
 private const val TRT_URL = "https://tv-trt1.medya.trt.com.tr/master.m3u8"
 private const val TRT_POSTER =
     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/85/TRT_1_logo_%282021-%29.svg/1280px-TRT_1_logo_%282021-%29.svg.png"
@@ -43,7 +46,8 @@ class Cstrsp : MainAPI() {
     // of domains (see fetchRoxieDomains) and only some answer at any moment (the rest are
     // Cloudflare-blocked), so we remember a working one and try it first next time.
     @Volatile private var roxieGoodDomain: String? = null
-    private var isDomainChecked = false
+    @Volatile private var isDomainChecked = false
+    private val domainMutex = Mutex()
     // Several interchangeable mirrors of the same backend. Some ISPs (notably in TR) block
     // individual mirrors by DNS, so we keep a few and pick the first that actually serves
     // data — see checkAndGetDomain. Order = preference when more than one is reachable.
@@ -80,34 +84,43 @@ class Cstrsp : MainAPI() {
     // and on expiry we just keep the default domain — a later per-call fetch retries anyway.
     private suspend fun checkAndGetDomain() {
         if (isDomainChecked) return
-        withTimeoutOrNull(DOMAIN_PROBE_TIMEOUT_MS) {
-            for (domain in domains) {
-                try {
-                    val response = app.get("$domain/api/matches/live")
-                    // Accept a mirror when its body actually parses as the match array. A
-                    // DNS-blocked/hijacked mirror can answer 200 with a stub page (some ISPs
-                    // return a placeholder instead of NXDOMAIN), which a status-only check
-                    // would accept — pinning us to a dead host so the whole Streamed source
-                    // silently vanishes. An EMPTY array is still a healthy mirror (a lull with
-                    // nothing live), so it must not be rejected: doing so sent us on to the
-                    // dead mirrors and burned the timeout budget on every call.
-                    val parsed = response.parsedSafe<Array<APIMatch>>()?.toList()
-                        ?.filter { it.id != null && it.title != null }
-                    if (response.code in 200..299 && parsed != null) {
-                        mainUrl = domain
-                        apiUrl = "$domain/api"
-                        isDomainChecked = true
-                        // The probe body IS the live-matches list; seed the cache so the
-                        // fetch that immediately follows doesn't repeat the same request.
-                        putCache("$apiUrl/matches/live", parsed)
-                        return@withTimeoutOrNull
+        domainMutex.withLock {
+            if (isDomainChecked) return@withLock
+
+            // Probe all mirrors at once. One ISP-blocked host must not consume the whole
+            // timeout before a healthy mirror is attempted.
+            val winner = withTimeoutOrNull(DOMAIN_PROBE_TIMEOUT_MS) {
+                coroutineScope {
+                    val results = Channel<Pair<String, List<APIMatch>?>>(domains.size)
+                    val jobs = domains.map { domain ->
+                        launch {
+                            val parsed = try {
+                                val response = app.get("$domain/api/matches/live")
+                                if (response.code !in 200..299) null
+                                else response.parsedSafe<Array<APIMatch>>()?.toList()
+                                    ?.filter { it.id != null && it.title != null }
+                            } catch (e: Exception) {
+                                null
+                            }
+                            results.send(domain to parsed)
+                        }
                     }
-                } catch (e: Exception) {}
+                    repeat(domains.size) {
+                        val result = results.receive()
+                        // An empty parsed array is a healthy mirror during a live-event lull.
+                        if (result.second != null) {
+                            jobs.forEach { it.cancel() }
+                            return@coroutineScope result
+                        }
+                    }
+                    null
+                }
             }
-        }
-        if (!isDomainChecked) {
-            mainUrl = domains.first()
-            apiUrl = "${domains.first()}/api"
+
+            val domain = winner?.first ?: domains.first()
+            mainUrl = domain
+            apiUrl = "$domain/api"
+            winner?.second?.let { putCache("$apiUrl/matches/live", it) }
             isDomainChecked = true
         }
     }
@@ -139,12 +152,12 @@ class Cstrsp : MainAPI() {
     )
 
     data class APIStream(
-        @JsonProperty("id") val id: String,
-        @JsonProperty("streamNo") val streamNo: Int,
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("streamNo") val streamNo: Int? = null,
         @JsonProperty("language") val language: String? = null,
         @JsonProperty("hd") val hd: Boolean = false,
-        @JsonProperty("embedUrl") val embedUrl: String,
-        @JsonProperty("source") val source: String
+        @JsonProperty("embedUrl") val embedUrl: String? = null,
+        @JsonProperty("source") val source: String? = null
     )
 
     data class PPVSubstream(
@@ -275,7 +288,8 @@ class Cstrsp : MainAPI() {
         @JsonProperty("domainsFile") val domainsFile: String = "domainsz58.txt"
     )
 
-    private val ppvDomains = listOf("api.ppv.to", "api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx")
+    // api.ppv.to currently fails TLS/SNI on several clients. Keep it as a last resort.
+    private val ppvDomains = listOf("api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx", "api.ppv.to")
 
     private suspend fun fetchPPVApi(): PPVResponse? = cached("ppv") {
         ppvDomains.firstNotNullOfOrNull { domain ->
@@ -309,6 +323,56 @@ class Cstrsp : MainAPI() {
         }
         pruneAmbiguousCdnChannels(out)
     } ?: emptyMap()
+
+    // StreamSports player pages expose the signed HLS URL in a normal <source> tag. Parse it
+    // directly so playback does not depend on a slow, ad-heavy WebView sniffing session.
+    private val cdnPlayerSourceRegex = Regex(
+        """<source[^>]+src\s*=\s*["']([^"']+\.m3u8[^"']*)["']""",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+    )
+    private val cdnPlayerSourceVarRegex =
+        Regex("""source\s*:\s*\{\s*src\s*:\s*([A-Za-z_$][\w$]*)""", RegexOption.IGNORE_CASE)
+    private val cdnJsStringVarRegex =
+        Regex("""var\s+([A-Za-z_$][\w$]*)\s*=\s*'([A-Za-z0-9_-]+)'\s*;""")
+    private val cdnJsConcatRefRegex = Regex("""\(([A-Za-z_$][\w$]*)\)""")
+
+    private fun cdnSourceFrom(html: String, playerUrl: String): String? {
+        cdnPlayerSourceRegex.find(html)?.groupValues?.get(1)?.let { direct ->
+            return try {
+                java.net.URI(playerUrl).resolve(direct.replace("&amp;", "&")).toString()
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        // Current pages split the signed URL into random Base64-url variables and concatenate
+        // decoder calls into the variable used by source:{src:...}. Decode that shape without
+        // executing the surrounding advertising JavaScript.
+        val sourceVar = cdnPlayerSourceVarRegex.find(html)?.groupValues?.get(1) ?: return null
+        val values = cdnJsStringVarRegex.findAll(html)
+            .associate { it.groupValues[1] to it.groupValues[2] }
+        val expression = Regex("""var\s+${Regex.escape(sourceVar)}\s*=\s*([^;]+);""")
+            .find(html)?.groupValues?.get(1) ?: return null
+        val decoded = StringBuilder()
+        try {
+            for (match in cdnJsConcatRefRegex.findAll(expression)) {
+                val encoded = values[match.groupValues[1]] ?: return null
+                val bytes = android.util.Base64.decode(
+                    encoded,
+                    android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
+                )
+                decoded.append(String(bytes, Charsets.UTF_8))
+            }
+        } catch (e: Exception) {
+            return null
+        }
+        return decoded.toString().takeIf { it.startsWith("http") }
+    }
+
+    private suspend fun resolveCdnChannel(url: String): String? = cached("cdn-channel-$url") {
+        val html = app.get(url, referer = "https://cdnlivetv.tv/").text
+        cdnSourceFrom(html, url)
+    }
 
     // Many cdnlivetv channels (ESPN US, Sky Sports F1, Premiere BR...) are attached to dozens
     // of events at once. The underlying stream is the channel's *current* live broadcast, so a
@@ -437,11 +501,24 @@ class Cstrsp : MainAPI() {
     // torn down by the wrapper's pop-ad scripts before the inner player requests anything,
     // which is why WF returned "no links found". Unwrap to the inner URL and extract that.
     // Falls back to the original URL when there's no iframe.
-    private val iframeSrcRegex = Regex("<iframe[^>]+src=\"([^\"]+)\"", RegexOption.IGNORE_CASE)
+    private val iframeSrcRegex = Regex(
+        """<iframe[^>]+src\s*=\s*["']([^"']+)["']""",
+        RegexOption.IGNORE_CASE
+    )
 
     private suspend fun unwrapWfEmbed(url: String): String = cached("wf-embed-$url") {
         val html = app.get(url, referer = "https://api.watchfooty.st/").text
-        iframeSrcRegex.find(html)?.groupValues?.get(1)?.takeIf { it.startsWith("http") }
+        iframeSrcRegex.find(html)?.groupValues?.get(1)?.let { raw ->
+            val src = raw.replace("&amp;", "&")
+            try {
+                when {
+                    src.startsWith("//") -> "https:$src"
+                    else -> java.net.URI(url).resolve(src).toString()
+                }
+            } catch (e: Exception) {
+                null
+            }
+        }?.takeIf { it.startsWith("http") }
     } ?: url
 
     // The roxie CDN pool sits behind Cloudflare, which rejects a plain request with 403 even
@@ -492,6 +569,36 @@ class Cstrsp : MainAPI() {
         val domainsFile = roxieDomainsFileRegex.find(html)?.value ?: "domainsz58.txt"
         RoxiePage(sources, domainsFile).takeIf { sources.isNotEmpty() }
     } ?: RoxiePage(emptyList(), "domainsz58.txt")
+
+    // Hide empty category pages and direct-HLS events whose entire rotating CDN pool is dead.
+    // Raw/DASH buttons remain listable and are validated in loadLinks with their own rules.
+    private suspend fun fetchPlayableRoxieEvents(): List<RoxieEvent> = cached("roxie-playable-events") {
+        val events = fetchRoxieEvents()
+        if (events.isEmpty()) return@cached null
+        coroutineScope {
+            val semaphore = Semaphore(4)
+            events.map { event ->
+                async {
+                    semaphore.withPermit {
+                        val page = fetchRoxiePage(event.path)
+                        when {
+                            page.sources.isEmpty() -> null
+                            page.sources.any { it.kind == "raw" } -> event
+                            else -> {
+                                val domains = fetchRoxieDomains(page.domainsFile)
+                                val playable = withTimeoutOrNull(ROXIE_LIST_PROBE_TIMEOUT_MS) {
+                                    page.sources.asSequence()
+                                        .filter { it.kind == "m3u8" }
+                                        .firstNotNullOfOrNull { resolveRoxieM3u8(it, domains) }
+                                }
+                                event.takeIf { playable != null }
+                            }
+                        }
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+    }
 
     // Resolves an m3u8 source to a playable playlist url, or null. Tries the last-known-good
     // domain first, then the rest, accepting the first that returns a real HLS playlist —
@@ -963,7 +1070,7 @@ class Cstrsp : MainAPI() {
 
     // roxiestreams has a small hand-curated slate, so one flat [Roxie] section is enough.
     private suspend fun roxieHomeSections(): List<HomePageList> {
-        val items = fetchRoxieEvents().map { roxieItem(it) }
+        val items = fetchPlayableRoxieEvents().map { roxieItem(it) }
         return if (items.isEmpty()) emptyList() else listOf(HomePageList("Live Events [Roxie]", items))
     }
 
@@ -1043,7 +1150,7 @@ class Cstrsp : MainAPI() {
         }
 
     private suspend fun searchRoxie(matcher: QueryMatcher): List<SearchResponse> =
-        fetchRoxieEvents()
+        fetchPlayableRoxieEvents()
             .filter { matcher.matches(it.name) }
             .map { roxieItem(it) }
 
@@ -1307,19 +1414,33 @@ class Cstrsp : MainAPI() {
                 val channels = event.channels.filter { !it.url.isNullOrBlank() }.take(8)
                 channels.resolveConcurrently { channel ->
                     val chName = channel.channelName ?: "Channel"
-                    loadExtractor(channel.url!!, "https://cdnlivetv.tv/", subtitleCallback) { link ->
+                    val direct = resolveCdnChannel(channel.url!!)
+                    if (direct != null) {
                         callback(
                             ExtractorLink(
                                 source = "StreamSports",
-                                name = withQualityLabel("StreamSports - $chName", link.quality),
-                                url = link.url,
-                                referer = link.referer,
-                                quality = link.quality,
-                                type = link.type,
-                                headers = link.headers,
-                                extractorData = link.extractorData
+                                name = "StreamSports - $chName",
+                                url = direct,
+                                referer = "https://cdnlivetv.tv/",
+                                quality = Qualities.Unknown.value,
+                                type = ExtractorLinkType.M3U8
                             )
                         )
+                    } else {
+                        loadExtractor(channel.url!!, "https://cdnlivetv.tv/", subtitleCallback) { link ->
+                            callback(
+                                ExtractorLink(
+                                    source = "StreamSports",
+                                    name = withQualityLabel("StreamSports - $chName", link.quality),
+                                    url = link.url,
+                                    referer = link.referer,
+                                    quality = link.quality,
+                                    type = link.type,
+                                    headers = link.headers,
+                                    extractorData = link.extractorData
+                                )
+                            )
+                        }
                     }
                 }
                 return true
@@ -1469,7 +1590,9 @@ class Cstrsp : MainAPI() {
                         app.get("$apiUrl/stream/${source.source}/${source.id}")
                             .parsedSafe<Array<APIStream>>()
                             ?.take(4) // Cap streams per source to prevent WebView extractors from timing out
-                            ?.map { source to it } ?: emptyList()
+                            ?.mapNotNull { stream ->
+                                stream.embedUrl?.takeIf { it.isNotBlank() }?.let { source to stream }
+                            } ?: emptyList()
                     } catch (e: Exception) {
                         emptyList()
                     }
@@ -1480,9 +1603,9 @@ class Cstrsp : MainAPI() {
         embeds.resolveConcurrently { (source, stream) ->
             val langStr = stream.language ?: "Unknown"
             val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
-            val base = "$sourceName - $langStr - Stream ${stream.streamNo}"
+            val base = "$sourceName - $langStr - Stream ${stream.streamNo ?: "?"}"
             // Pass the embed URL to our WebView extractor (or built-in extractors)
-            loadExtractor(encodeUrlNonAscii(stream.embedUrl), "$mainUrl/", subtitleCallback) { link ->
+            loadExtractor(encodeUrlNonAscii(stream.embedUrl!!), "$mainUrl/", subtitleCallback) { link ->
                 // Trust the extractor's detected resolution (from the master playlist).
                 // When it can't be determined we leave it Unknown rather than guessing
                 // 720p, so we never label a stream with a resolution we didn't measure.
