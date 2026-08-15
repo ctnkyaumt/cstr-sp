@@ -55,6 +55,17 @@ class Cstrsp : MainAPI() {
         "https://streamed.pk", "https://streamed.st", "https://streamed.su", "https://streami.su"
     )
 
+    // A mirror can pass the inexpensive match-list probe and still time out on the
+    // per-source endpoint a moment later. Keep the selected mirror first for locality,
+    // then retry the same path on every other mirror before reporting an empty result.
+    // This is especially important for live events: the UI has already shown the card,
+    // so losing the second request otherwise looks like a dead source.
+    private fun streamedApiCandidates(endpoint: String): List<String> {
+        val suffix = endpoint.substringAfter("/api", "")
+        if (suffix.isBlank()) return listOf(endpoint)
+        return (listOf(endpoint) + domains.map { "$it/api$suffix" }).distinct()
+    }
+
     // Short-lived response cache. A normal flow (home/search -> click -> play) hits the
     // same upstream list APIs three times within seconds; only the first call should pay
     // the network round-trip. Failures are never cached, so a flaky source retries on the
@@ -105,15 +116,22 @@ class Cstrsp : MainAPI() {
                             results.send(domain to parsed)
                         }
                     }
+                    var firstHealthy: Pair<String, List<APIMatch>?>? = null
                     repeat(domains.size) {
                         val result = results.receive()
                         // An empty parsed array is a healthy mirror during a live-event lull.
                         if (result.second != null) {
-                            jobs.forEach { it.cancel() }
-                            return@coroutineScope result
+                            firstHealthy = firstHealthy ?: result
+                            // Prefer a mirror that actually has events when another mirror
+                            // is returning a stale/empty snapshot. If every mirror is empty,
+                            // the first valid one below still counts as healthy.
+                            if (result.second!!.isNotEmpty()) {
+                                jobs.forEach { it.cancel() }
+                                return@coroutineScope result
+                            }
                         }
                     }
-                    null
+                    firstHealthy
                 }
             }
 
@@ -402,10 +420,42 @@ class Cstrsp : MainAPI() {
         return cleaned
     }
 
-    // Helper to fetch matches from streamed.pk
+    // Helper to fetch matches from the selected Streamed mirror, with mirror failover.
     private suspend fun fetchMatches(endpoint: String): List<APIMatch> = cached(endpoint) {
-        app.get(endpoint).parsedSafe<Array<APIMatch>>()?.toList()?.filter { it.id != null && it.title != null }
+        var empty: List<APIMatch>? = null
+        for (candidate in streamedApiCandidates(endpoint)) {
+            val parsed = try {
+                app.get(candidate).parsedSafe<Array<APIMatch>>()?.toList()
+                    ?.filter { it.id != null && it.title != null }
+            } catch (e: Exception) {
+                null
+            }
+            if (parsed == null) continue
+            if (parsed.isNotEmpty()) return@cached parsed
+            empty = empty ?: parsed
+        }
+        empty
     } ?: emptyList()
+
+    // The match list and its stream list are separate requests. Retry the latter on
+    // another mirror when the first host is temporarily slow or DNS-blocked.
+    private suspend fun fetchStreams(source: APISource): List<APIStream> {
+        val sourceName = source.source ?: return emptyList()
+        val sourceId = source.id ?: return emptyList()
+        val path = "/stream/$sourceName/$sourceId"
+        var empty: List<APIStream>? = null
+        for (candidate in streamedApiCandidates("$apiUrl$path")) {
+            val parsed = try {
+                app.get(candidate).parsedSafe<Array<APIStream>>()?.toList()
+            } catch (e: Exception) {
+                null
+            }
+            if (parsed == null) continue
+            if (parsed.isNotEmpty()) return parsed
+            empty = empty ?: parsed
+        }
+        return empty.orEmpty()
+    }
 
     // An event row in the homepage table: <td><a href="/path">Name</a></td>. Scoped to the
     // events table (see fetchRoxieEvents) so it never picks up the nav's category links.
@@ -1587,12 +1637,11 @@ class Cstrsp : MainAPI() {
             sources.map { source ->
                 async {
                     try {
-                        app.get("$apiUrl/stream/${source.source}/${source.id}")
-                            .parsedSafe<Array<APIStream>>()
-                            ?.take(4) // Cap streams per source to prevent WebView extractors from timing out
-                            ?.mapNotNull { stream ->
+                        fetchStreams(source)
+                            .take(4) // Cap streams per source to prevent WebView extractors from timing out
+                            .mapNotNull { stream ->
                                 stream.embedUrl?.takeIf { it.isNotBlank() }?.let { source to stream }
-                            } ?: emptyList()
+                            }
                     } catch (e: Exception) {
                         emptyList()
                     }
