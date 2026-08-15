@@ -1640,10 +1640,11 @@ class Cstrsp : MainAPI() {
                         val available = fetchStreams(source)
                         // Streamed commonly publishes a second non-HD backup beside the
                         // real feed (for example admin/1 = hd=true, admin/2 = hd=false).
-                        // Prefer the marked HD set when one exists so a low-quality backup
-                        // does not appear as an equal/default source. If a provider has no
-                        // HD flag at all, retain its feeds as a last-resort fallback.
-                        val preferred = available.filter { it.hd }.ifEmpty { available }
+                        // Resolve marked HD feeds first, but retain the backups: the HD embed
+                        // can be stale or blocked while the fallback is still playable. The
+                        // extractor measures the actual resolution, so a 540p feed is never
+                        // mislabeled as HD just because it was listed first by the API.
+                        val preferred = available.sortedByDescending { it.hd }
                             .take(4) // Cap streams per source to prevent WebView extractors from timing out
                         preferred
                             .mapNotNull { stream ->
