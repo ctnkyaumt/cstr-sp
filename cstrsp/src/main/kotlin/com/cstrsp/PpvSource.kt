@@ -81,31 +81,31 @@ object PpvSource {
         stream.id != null && isLivePpv(category, stream) &&
             (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())
 
-    fun MainAPI.ppvItem(stream: PPVStream): SearchResponse =
-        newLiveSearchResponse("${stream.name ?: "Unknown Event"} [PPV]", "https://ppv.domains/${stream.id}") {
+    fun ppvItem(api: MainAPI, stream: PPVStream): SearchResponse =
+        api.newLiveSearchResponse("${stream.name ?: "Unknown Event"} [PPV]", "https://ppv.domains/${stream.id}") {
             this.posterUrl = ppvPoster(stream)
         }
 
-    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
+    suspend fun getHomeSections(api: MainAPI): List<HomePageList> =
         fetchPPVApi()?.streams.orEmpty().mapNotNull { category ->
             val items = category.streams.orEmpty()
                 .filter { ppvListable(category, it) }
-                .map { ppvItem(it) }
+                .map { ppvItem(api, it) }
             if (items.isEmpty()) null
             else HomePageList("${category.category_name ?: category.category ?: "Unknown"} [PPV]", items)
         }
 
-    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> =
         fetchPPVApi()?.streams.orEmpty().flatMap { category ->
             category.streams.orEmpty()
                 .filter { stream ->
                     ppvListable(category, stream) &&
                         matcher.matches(stream.name ?: "Unknown Event", category.category_name, category.category)
                 }
-                .map { ppvItem(it) }
+                .map { ppvItem(api, it) }
         }
 
-    suspend fun MainAPI.load(url: String): LoadResponse? {
+    suspend fun load(api: MainAPI, url: String): LoadResponse? {
         if (!url.startsWith("https://ppv.domains/")) return null
         val streamId = url.substringAfterLast("/").toIntOrNull()
         val stream = fetchPPVApi()?.streams
@@ -113,7 +113,7 @@ object PpvSource {
             ?: return null
         val title = stream.name ?: "Live Stream"
 
-        return newLiveStreamLoadResponse(
+        return api.newLiveStreamLoadResponse(
             name = "$title [PPV]",
             url = url,
             dataUrl = stream.toJson()

@@ -45,29 +45,29 @@ object StreamfreeSource {
             ?.filter { !it.name.isNullOrBlank() && !it.embedUrl.isNullOrBlank() }
     } ?: emptyList()
 
-    fun MainAPI.streamfreeItem(stream: StreamfreeStream): SearchResponse =
-        newLiveSearchResponse("${stream.name ?: "Live Event"} [StreamFree]", "https://streamfree.domains/${stream.streamKey ?: stream.name}") {
+    fun streamfreeItem(api: MainAPI, stream: StreamfreeStream): SearchResponse =
+        api.newLiveSearchResponse("${stream.name ?: "Live Event"} [StreamFree]", "https://streamfree.domains/${stream.streamKey ?: stream.name}") {
             this.posterUrl = stream.thumbnailUrl
         }
 
-    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
+    suspend fun getHomeSections(api: MainAPI): List<HomePageList> =
         fetchStreamfreeStreams()
             .groupBy { it.category?.replaceFirstChar { c -> c.uppercase() } ?: "Live" }
             .map { (cat, streams) ->
-                HomePageList("$cat [StreamFree]", streams.map { streamfreeItem(it) })
+                HomePageList("$cat [StreamFree]", streams.map { streamfreeItem(api, it) })
             }
 
-    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> =
         fetchStreamfreeStreams()
             .filter { matcher.matches(it.name, it.category, it.league) }
-            .map { streamfreeItem(it) }
+            .map { streamfreeItem(api, it) }
 
-    suspend fun MainAPI.load(url: String): LoadResponse? {
+    suspend fun load(api: MainAPI, url: String): LoadResponse? {
         if (!url.startsWith("https://streamfree.domains/")) return null
         val key = url.substringAfterLast("/")
         val stream = fetchStreamfreeStreams().find { it.streamKey == key || it.name == key } ?: return null
         val title = stream.name ?: "Live Stream"
-        return newLiveStreamLoadResponse(
+        return api.newLiveStreamLoadResponse(
             name = "$title [StreamFree]",
             url = url,
             dataUrl = stream.toJson()

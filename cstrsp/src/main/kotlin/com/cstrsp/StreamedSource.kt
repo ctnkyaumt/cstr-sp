@@ -160,14 +160,14 @@ object StreamedSource {
         else -> null
     }
 
-    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
+    suspend fun getHomeSections(api: MainAPI): List<HomePageList> =
         fetchMatches("$apiUrl/matches/live")
             .groupBy { it.category ?: "Other" }
             .mapNotNull { (category, matches) ->
                 val items = matches.mapNotNull { match ->
                     val id = match.id ?: return@mapNotNull null
                     val title = match.title ?: return@mapNotNull null
-                    newLiveSearchResponse(title, "$mainUrl/match/$id") {
+                    api.newLiveSearchResponse(title, "$mainUrl/match/$id") {
                         this.posterUrl = streamedPoster(match)
                     }
                 }
@@ -175,7 +175,7 @@ object StreamedSource {
                 else HomePageList("${category.replaceFirstChar { it.uppercase() }} [Streamed]", items)
             }
 
-    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> {
+    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> {
         val live = fetchMatches("$apiUrl/matches/live")
         val futureCutoff = System.currentTimeMillis() + 12 * 3_600_000L
         val allToday = fetchMatches("$apiUrl/matches/all-today")
@@ -189,13 +189,13 @@ object StreamedSource {
             .mapNotNull { match ->
                 val id = match.id ?: return@mapNotNull null
                 val title = match.title ?: return@mapNotNull null
-                newLiveSearchResponse(title, "$mainUrl/match/$id") {
+                api.newLiveSearchResponse(title, "$mainUrl/match/$id") {
                     this.posterUrl = streamedPoster(match)
                 }
             }
     }
 
-    suspend fun MainAPI.load(url: String): LoadResponse? {
+    suspend fun load(api: MainAPI, url: String): LoadResponse? {
         val matchId = url.substringAfterLast("/")
         var match = fetchMatches("$apiUrl/matches/live").find { it.id == matchId }
         var isLive = true
@@ -213,7 +213,7 @@ object StreamedSource {
         val sourceLabel = if (sourceNames.isNotEmpty()) " [$sourceNames]" else ""
         val liveLabel = if (!isLive) " [Upcoming]" else ""
 
-        return newLiveStreamLoadResponse(
+        return api.newLiveStreamLoadResponse(
             name = "${match.title}$sourceLabel$liveLabel",
             url = url,
             dataUrl = (match.sources ?: emptyList<APISource>()).toJson()

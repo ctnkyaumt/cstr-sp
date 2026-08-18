@@ -75,8 +75,8 @@ object WatchFootySource {
     fun wfListable(match: WFMatch): Boolean =
         match.matchId != null && wfHasHd(match) && isLiveWf(match)
 
-    fun MainAPI.wfItem(match: WFMatch): SearchResponse =
-        newLiveSearchResponse("${match.title ?: "Live Event"} [WF]", "https://wf.domains/${match.matchId}") {
+    fun wfItem(api: MainAPI, match: WFMatch): SearchResponse =
+        api.newLiveSearchResponse("${match.title ?: "Live Event"} [WF]", "https://wf.domains/${match.matchId}") {
             this.posterUrl = wfPoster(match)
         }
 
@@ -95,29 +95,29 @@ object WatchFootySource {
         }?.takeIf { it.startsWith("http") }
     } ?: url
 
-    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
+    suspend fun getHomeSections(api: MainAPI): List<HomePageList> =
         fetchWFMatches()
             .filter { wfListable(it) }
             .groupBy { it.sport ?: "Unknown" }
             .map { (sport, matches) ->
-                HomePageList("${sport.replaceFirstChar { it.uppercase() }} [WF]", matches.map { wfItem(it) })
+                HomePageList("${sport.replaceFirstChar { it.uppercase() }} [WF]", matches.map { wfItem(api, it) })
             }
 
-    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> =
         fetchWFMatches()
             .filter { match ->
                 wfListable(match) && matcher.matches(match.title ?: "Live Event", match.sport, match.league, match.teams?.home?.name, match.teams?.away?.name)
             }
-            .map { wfItem(it) }
+            .map { wfItem(api, it) }
 
-    suspend fun MainAPI.load(url: String): LoadResponse? {
+    suspend fun load(api: MainAPI, url: String): LoadResponse? {
         if (!url.startsWith("https://wf.domains/")) return null
         val matchId = url.substringAfterLast("/")
         val match = fetchWFMatches().find { it.matchId == matchId } ?: return null
         if (match.streams.isNullOrEmpty()) return null
         val title = match.title ?: "Live Stream"
 
-        return newLiveStreamLoadResponse(
+        return api.newLiveStreamLoadResponse(
             name = "$title [WF]",
             url = url,
             dataUrl = match.toJson()

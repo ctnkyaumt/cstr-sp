@@ -65,8 +65,8 @@ object StreamSportsSource {
 
     fun cdnPoster(event: CdnEvent): String? = event.homeTeamImg ?: event.eventImg
 
-    fun MainAPI.cdnItem(event: CdnEvent): SearchResponse =
-        newLiveSearchResponse("${cdnTitle(event)} [StreamSports]", "https://cdn.domains/${event.gameID}") {
+    fun cdnItem(api: MainAPI, event: CdnEvent): SearchResponse =
+        api.newLiveSearchResponse("${cdnTitle(event)} [StreamSports]", "https://cdn.domains/${event.gameID}") {
             this.posterUrl = cdnPoster(event)
         }
 
@@ -142,24 +142,24 @@ object StreamSportsSource {
         pruneAmbiguousCdnChannels(out)
     } ?: emptyMap()
 
-    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
+    suspend fun getHomeSections(api: MainAPI): List<HomePageList> =
         fetchCdnEvents().mapNotNull { (sport, events) ->
-            val items = events.filter { isLiveCdn(it) }.map { cdnItem(it) }
+            val items = events.filter { isLiveCdn(it) }.map { cdnItem(api, it) }
             if (items.isEmpty()) null
             else HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", items)
         }
 
-    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> =
         fetchCdnEvents().flatMap { (sport, events) ->
-            events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport, it.homeTeam, it.awayTeam, it.event) }.map { cdnItem(it) }
+            events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport, it.homeTeam, it.awayTeam, it.event) }.map { cdnItem(api, it) }
         }
 
-    suspend fun MainAPI.load(url: String): LoadResponse? {
+    suspend fun load(api: MainAPI, url: String): LoadResponse? {
         if (!url.startsWith("https://cdn.domains/")) return null
         val gameId = url.substringAfterLast("/")
         val event = fetchCdnEvents().values.flatten().find { it.gameID == gameId } ?: return null
         val title = cdnTitle(event)
-        return newLiveStreamLoadResponse(
+        return api.newLiveStreamLoadResponse(
             name = "$title [StreamSports]",
             url = url,
             dataUrl = event.toJson()

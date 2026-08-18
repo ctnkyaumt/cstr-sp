@@ -148,8 +148,8 @@ object RoxieSourceProvider {
         null
     }
 
-    fun MainAPI.roxieItem(event: RoxieEvent): SearchResponse =
-        newLiveSearchResponse("${event.name} [Roxie]", "https://roxie.domains/${roxieKey(event.path)}") {}
+    fun roxieItem(api: MainAPI, event: RoxieEvent): SearchResponse =
+        api.newLiveSearchResponse("${event.name} [Roxie]", "https://roxie.domains/${roxieKey(event.path)}") {}
 
     suspend fun fetchRoxieEvents(): List<RoxieEvent> = CstrspCache.cached("roxie-events") {
         val pages = listOf("/") + roxieCategories
@@ -236,23 +236,23 @@ object RoxieSourceProvider {
         return null
     }
 
-    suspend fun MainAPI.getHomeSections(): List<HomePageList> {
-        val items = fetchPlayableRoxieEvents().map { roxieItem(it) }
+    suspend fun getHomeSections(api: MainAPI): List<HomePageList> {
+        val items = fetchPlayableRoxieEvents().map { roxieItem(api, it) }
         return if (items.isEmpty()) emptyList() else listOf(HomePageList("Live Events [Roxie]", items))
     }
 
-    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> =
         fetchPlayableRoxieEvents()
             .filter { matcher.matches(it.name) }
-            .map { roxieItem(it) }
+            .map { roxieItem(api, it) }
 
-    suspend fun MainAPI.load(url: String): LoadResponse? {
+    suspend fun load(api: MainAPI, url: String): LoadResponse? {
         if (!url.startsWith("https://roxie.domains/")) return null
         val path = roxiePathFromKey(url.substringAfterLast("/")) ?: return null
         val page = fetchRoxiePage(path)
         if (page.sources.isEmpty()) return null
         val name = fetchRoxieEvents().find { it.path == path }?.name ?: path.trim('/').replace('-', ' ')
-        return newLiveStreamLoadResponse(
+        return api.newLiveStreamLoadResponse(
             name = "$name [Roxie]",
             url = url,
             dataUrl = RoxieLoadData(name, path, page.sources, page.domainsFile).toJson()
