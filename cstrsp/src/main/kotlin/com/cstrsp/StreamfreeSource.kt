@@ -1,9 +1,9 @@
 package com.cstrsp
 
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.fasterxml.jackson.core.type.TypeReference
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -31,6 +31,12 @@ data class StreamfreeResponse(
     @JsonProperty("streams") val streams: List<StreamfreeStream>? = null
 )
 
+data class StreamfreeToken(
+    @JsonProperty("_t") val t: String? = null,
+    @JsonProperty("_e") val e: Long? = null,
+    @JsonProperty("_n") val n: String? = null
+)
+
 object StreamfreeSource {
     private const val streamfreeUrl = "https://streamfree.top"
 
@@ -39,24 +45,24 @@ object StreamfreeSource {
             ?.filter { !it.name.isNullOrBlank() && !it.embedUrl.isNullOrBlank() }
     } ?: emptyList()
 
-    fun streamfreeItem(stream: StreamfreeStream): SearchResponse =
+    fun MainAPI.streamfreeItem(stream: StreamfreeStream): SearchResponse =
         newLiveSearchResponse("${stream.name ?: "Live Event"} [StreamFree]", "https://streamfree.domains/${stream.streamKey ?: stream.name}") {
             this.posterUrl = stream.thumbnailUrl
         }
 
-    suspend fun getHomeSections(): List<HomePageList> =
+    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
         fetchStreamfreeStreams()
             .groupBy { it.category?.replaceFirstChar { c -> c.uppercase() } ?: "Live" }
             .map { (cat, streams) ->
                 HomePageList("$cat [StreamFree]", streams.map { streamfreeItem(it) })
             }
 
-    suspend fun search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
         fetchStreamfreeStreams()
             .filter { matcher.matches(it.name, it.category, it.league) }
             .map { streamfreeItem(it) }
 
-    suspend fun load(url: String): LoadResponse? {
+    suspend fun MainAPI.load(url: String): LoadResponse? {
         if (!url.startsWith("https://streamfree.domains/")) return null
         val key = url.substringAfterLast("/")
         val stream = fetchStreamfreeStreams().find { it.streamKey == key || it.name == key } ?: return null
@@ -95,32 +101,33 @@ object StreamfreeSource {
             val m0x = Regex("""const\s+_0x\s*=\s*(\{.*?\});""").find(embedHtml)
             if (m0x != null) {
                 try {
-                    val mapType = object : TypeReference<Map<String, Map<String, Any>>>() {}
-                    val qMap = AppUtils.mapper.readValue<Map<String, Map<String, Any>>>(m0x.groupValues[1], mapType)
-                    for ((q, params) in qMap) {
-                        val t = params["_t"]?.toString() ?: continue
-                        val e = params["_e"]?.toString() ?: continue
-                        val n = params["_n"]?.toString() ?: continue
-                        val directUrl = "$streamfreeUrl/live/${stream.streamKey}$q/index.m3u8?_t=$t&_e=$e&_n=$n"
-                        val quality = when (q.lowercase()) {
-                            "2160p", "4k" -> Qualities.P2160.value
-                            "1080p" -> Qualities.P1080.value
-                            "720p" -> Qualities.P720.value
-                            "540p" -> Qualities.P480.value
-                            else -> Qualities.Unknown.value
-                        }
-                        val labeled = withQualityLabel("StreamFree - $q", quality)
-                        callback.invoke(
-                            ExtractorLink(
-                                source = "StreamFree",
-                                name = labeled,
-                                url = directUrl,
-                                referer = "$streamfreeUrl/",
-                                quality = quality,
-                                type = ExtractorLinkType.M3U8
+                    val qMap = AppUtils.parseJson<Map<String, StreamfreeToken>>(m0x.groupValues[1])
+                    if (qMap != null) {
+                        for ((q, params) in qMap) {
+                            val t = params.t ?: continue
+                            val e = params.e ?: continue
+                            val n = params.n ?: continue
+                            val directUrl = "$streamfreeUrl/live/${stream.streamKey}$q/index.m3u8?_t=$t&_e=$e&_n=$n"
+                            val quality = when (q.lowercase()) {
+                                "2160p", "4k" -> Qualities.P2160.value
+                                "1080p" -> Qualities.P1080.value
+                                "720p" -> Qualities.P720.value
+                                "540p" -> Qualities.P480.value
+                                else -> Qualities.Unknown.value
+                            }
+                            val labeled = withQualityLabel("StreamFree - $q", quality)
+                            callback.invoke(
+                                ExtractorLink(
+                                    source = "StreamFree",
+                                    name = labeled,
+                                    url = directUrl,
+                                    referer = "$streamfreeUrl/",
+                                    quality = quality,
+                                    type = ExtractorLinkType.M3U8
+                                )
                             )
-                        )
-                        foundDirect = true
+                            foundDirect = true
+                        }
                     }
                 } catch (e: Exception) {}
             }

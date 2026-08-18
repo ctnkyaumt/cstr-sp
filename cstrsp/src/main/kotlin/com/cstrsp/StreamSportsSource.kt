@@ -3,6 +3,7 @@ package com.cstrsp
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -64,7 +65,7 @@ object StreamSportsSource {
 
     fun cdnPoster(event: CdnEvent): String? = event.homeTeamImg ?: event.eventImg
 
-    fun cdnItem(event: CdnEvent): SearchResponse =
+    fun MainAPI.cdnItem(event: CdnEvent): SearchResponse =
         newLiveSearchResponse("${cdnTitle(event)} [StreamSports]", "https://cdn.domains/${event.gameID}") {
             this.posterUrl = cdnPoster(event)
         }
@@ -141,19 +142,19 @@ object StreamSportsSource {
         pruneAmbiguousCdnChannels(out)
     } ?: emptyMap()
 
-    suspend fun getHomeSections(): List<HomePageList> =
+    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
         fetchCdnEvents().mapNotNull { (sport, events) ->
             val items = events.filter { isLiveCdn(it) }.map { cdnItem(it) }
             if (items.isEmpty()) null
             else HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", items)
         }
 
-    suspend fun search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
         fetchCdnEvents().flatMap { (sport, events) ->
             events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport, it.homeTeam, it.awayTeam, it.event) }.map { cdnItem(it) }
         }
 
-    suspend fun load(url: String): LoadResponse? {
+    suspend fun MainAPI.load(url: String): LoadResponse? {
         if (!url.startsWith("https://cdn.domains/")) return null
         val gameId = url.substringAfterLast("/")
         val event = fetchCdnEvents().values.flatten().find { it.gameID == gameId } ?: return null

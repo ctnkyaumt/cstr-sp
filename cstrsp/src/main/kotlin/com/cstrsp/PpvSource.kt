@@ -3,6 +3,7 @@ package com.cstrsp
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -80,12 +81,12 @@ object PpvSource {
         stream.id != null && isLivePpv(category, stream) &&
             (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())
 
-    fun ppvItem(stream: PPVStream): SearchResponse =
+    fun MainAPI.ppvItem(stream: PPVStream): SearchResponse =
         newLiveSearchResponse("${stream.name ?: "Unknown Event"} [PPV]", "https://ppv.domains/${stream.id}") {
             this.posterUrl = ppvPoster(stream)
         }
 
-    suspend fun getHomeSections(): List<HomePageList> =
+    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
         fetchPPVApi()?.streams.orEmpty().mapNotNull { category ->
             val items = category.streams.orEmpty()
                 .filter { ppvListable(category, it) }
@@ -94,7 +95,7 @@ object PpvSource {
             else HomePageList("${category.category_name ?: category.category ?: "Unknown"} [PPV]", items)
         }
 
-    suspend fun search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
         fetchPPVApi()?.streams.orEmpty().flatMap { category ->
             category.streams.orEmpty()
                 .filter { stream ->
@@ -104,7 +105,7 @@ object PpvSource {
                 .map { ppvItem(it) }
         }
 
-    suspend fun load(url: String): LoadResponse? {
+    suspend fun MainAPI.load(url: String): LoadResponse? {
         if (!url.startsWith("https://ppv.domains/")) return null
         val streamId = url.substringAfterLast("/").toIntOrNull()
         val stream = fetchPPVApi()?.streams

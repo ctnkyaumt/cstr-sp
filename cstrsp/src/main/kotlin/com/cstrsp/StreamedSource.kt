@@ -3,6 +3,7 @@ package com.cstrsp
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -159,7 +160,7 @@ object StreamedSource {
         else -> null
     }
 
-    suspend fun getHomeSections(): List<HomePageList> =
+    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
         fetchMatches("$apiUrl/matches/live")
             .groupBy { it.category ?: "Other" }
             .mapNotNull { (category, matches) ->
@@ -174,7 +175,7 @@ object StreamedSource {
                 else HomePageList("${category.replaceFirstChar { it.uppercase() }} [Streamed]", items)
             }
 
-    suspend fun search(matcher: QueryMatcher): List<SearchResponse> {
+    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> {
         val live = fetchMatches("$apiUrl/matches/live")
         val futureCutoff = System.currentTimeMillis() + 12 * 3_600_000L
         val allToday = fetchMatches("$apiUrl/matches/all-today")
@@ -194,7 +195,7 @@ object StreamedSource {
             }
     }
 
-    suspend fun load(url: String): LoadResponse? {
+    suspend fun MainAPI.load(url: String): LoadResponse? {
         val matchId = url.substringAfterLast("/")
         var match = fetchMatches("$apiUrl/matches/live").find { it.id == matchId }
         var isLive = true

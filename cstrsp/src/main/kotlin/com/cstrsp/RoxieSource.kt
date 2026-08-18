@@ -3,6 +3,7 @@ package com.cstrsp
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -147,7 +148,7 @@ object RoxieSourceProvider {
         null
     }
 
-    fun roxieItem(event: RoxieEvent): SearchResponse =
+    fun MainAPI.roxieItem(event: RoxieEvent): SearchResponse =
         newLiveSearchResponse("${event.name} [Roxie]", "https://roxie.domains/${roxieKey(event.path)}") {}
 
     suspend fun fetchRoxieEvents(): List<RoxieEvent> = CstrspCache.cached("roxie-events") {
@@ -235,17 +236,17 @@ object RoxieSourceProvider {
         return null
     }
 
-    suspend fun getHomeSections(): List<HomePageList> {
+    suspend fun MainAPI.getHomeSections(): List<HomePageList> {
         val items = fetchPlayableRoxieEvents().map { roxieItem(it) }
         return if (items.isEmpty()) emptyList() else listOf(HomePageList("Live Events [Roxie]", items))
     }
 
-    suspend fun search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
         fetchPlayableRoxieEvents()
             .filter { matcher.matches(it.name) }
             .map { roxieItem(it) }
 
-    suspend fun load(url: String): LoadResponse? {
+    suspend fun MainAPI.load(url: String): LoadResponse? {
         if (!url.startsWith("https://roxie.domains/")) return null
         val path = roxiePathFromKey(url.substringAfterLast("/")) ?: return null
         val page = fetchRoxiePage(path)

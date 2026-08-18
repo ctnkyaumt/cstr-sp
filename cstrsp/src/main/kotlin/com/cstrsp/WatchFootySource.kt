@@ -3,6 +3,7 @@ package com.cstrsp
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -74,7 +75,7 @@ object WatchFootySource {
     fun wfListable(match: WFMatch): Boolean =
         match.matchId != null && wfHasHd(match) && isLiveWf(match)
 
-    fun wfItem(match: WFMatch): SearchResponse =
+    fun MainAPI.wfItem(match: WFMatch): SearchResponse =
         newLiveSearchResponse("${match.title ?: "Live Event"} [WF]", "https://wf.domains/${match.matchId}") {
             this.posterUrl = wfPoster(match)
         }
@@ -94,7 +95,7 @@ object WatchFootySource {
         }?.takeIf { it.startsWith("http") }
     } ?: url
 
-    suspend fun getHomeSections(): List<HomePageList> =
+    suspend fun MainAPI.getHomeSections(): List<HomePageList> =
         fetchWFMatches()
             .filter { wfListable(it) }
             .groupBy { it.sport ?: "Unknown" }
@@ -102,14 +103,14 @@ object WatchFootySource {
                 HomePageList("${sport.replaceFirstChar { it.uppercase() }} [WF]", matches.map { wfItem(it) })
             }
 
-    suspend fun search(matcher: QueryMatcher): List<SearchResponse> =
+    suspend fun MainAPI.search(matcher: QueryMatcher): List<SearchResponse> =
         fetchWFMatches()
             .filter { match ->
                 wfListable(match) && matcher.matches(match.title ?: "Live Event", match.sport, match.league, match.teams?.home?.name, match.teams?.away?.name)
             }
             .map { wfItem(it) }
 
-    suspend fun load(url: String): LoadResponse? {
+    suspend fun MainAPI.load(url: String): LoadResponse? {
         if (!url.startsWith("https://wf.domains/")) return null
         val matchId = url.substringAfterLast("/")
         val match = fetchWFMatches().find { it.matchId == matchId } ?: return null

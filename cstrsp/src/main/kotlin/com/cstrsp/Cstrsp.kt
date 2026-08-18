@@ -22,12 +22,12 @@ class Cstrsp : MainAPI() {
         StreamedSource.checkAndGetDomain()
         val sections = coroutineScope {
             listOf(
-                async { safeList { StreamedSource.getHomeSections() } },
-                async { safeList { StreamfreeSource.getHomeSections() } },
-                async { safeList { PpvSource.getHomeSections() } },
-                async { safeList { WatchFootySource.getHomeSections() } },
-                async { safeList { StreamSportsSource.getHomeSections() } },
-                async { safeList { RoxieSourceProvider.getHomeSections() } }
+                async { safeList { with(StreamedSource) { getHomeSections() } } },
+                async { safeList { with(StreamfreeSource) { getHomeSections() } } },
+                async { safeList { with(PpvSource) { getHomeSections() } } },
+                async { safeList { with(WatchFootySource) { getHomeSections() } } },
+                async { safeList { with(StreamSportsSource) { getHomeSections() } } },
+                async { safeList { with(RoxieSourceProvider) { getHomeSections() } } }
             ).awaitAll()
         }.flatten()
         return newHomePageResponse(sections)
@@ -38,16 +38,16 @@ class Cstrsp : MainAPI() {
         val matcher = QueryMatcher(query)
         val results = mutableListOf<SearchResponse>()
 
-        results.add(TrtSource.searchItem())
+        results.add(with(TrtSource) { searchItem() })
 
         coroutineScope {
             listOf(
-                async { safeList { StreamedSource.search(matcher) } },
-                async { safeList { StreamfreeSource.search(matcher) } },
-                async { safeList { PpvSource.search(matcher) } },
-                async { safeList { WatchFootySource.search(matcher) } },
-                async { safeList { StreamSportsSource.search(matcher) } },
-                async { safeList { RoxieSourceProvider.search(matcher) } }
+                async { safeList { with(StreamedSource) { search(matcher) } } },
+                async { safeList { with(StreamfreeSource) { search(matcher) } } },
+                async { safeList { with(PpvSource) { search(matcher) } } },
+                async { safeList { with(WatchFootySource) { search(matcher) } } },
+                async { safeList { with(StreamSportsSource) { search(matcher) } } },
+                async { safeList { with(RoxieSourceProvider) { search(matcher) } } }
             ).awaitAll()
         }.forEach { results.addAll(it) }
 
@@ -56,13 +56,13 @@ class Cstrsp : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         StreamedSource.checkAndGetDomain()
-        TrtSource.load(url)?.let { return it }
-        StreamfreeSource.load(url)?.let { return it }
-        PpvSource.load(url)?.let { return it }
-        WatchFootySource.load(url)?.let { return it }
-        StreamSportsSource.load(url)?.let { return it }
-        RoxieSourceProvider.load(url)?.let { return it }
-        return StreamedSource.load(url)
+        with(TrtSource) { load(url) }?.let { return it }
+        with(StreamfreeSource) { load(url) }?.let { return it }
+        with(PpvSource) { load(url) }?.let { return it }
+        with(WatchFootySource) { load(url) }?.let { return it }
+        with(StreamSportsSource) { load(url) }?.let { return it }
+        with(RoxieSourceProvider) { load(url) }?.let { return it }
+        return with(StreamedSource) { load(url) }
     }
 
     override suspend fun loadLinks(
