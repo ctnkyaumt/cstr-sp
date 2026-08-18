@@ -2,20 +2,20 @@
     {
         "url": "https://raw.githubusercontent.com/ctnkyaumt/cstr-sp/builds/cstrsp.cs3",
         "status": 1,
-        "version": 8,
+        "version": 12,
         "name": "cstrsp",
         "internalName": "cstrsp",
         "authors": [
             "cstrsp"
         ],
         "description": "strmd.link parser extension",
-        "fileSize": 111842,
+        "fileSize": 127243,
         "repositoryUrl": "https://github.com/ctnkyaumt/cstr-sp",
         "language": "en",
         "tvTypes": [
             "Live"
         ],
         "apiVersion": 1,
-        "fileHash": "sha256-aa19fbf8519406fefcf6ab7b013c4fcaa205b02a3b4db2241844a59e2cadb3bd"
+        "fileHash": "sha256-8aa56581fec12cbde51d4ac5b6087396a27d377b0c73866b5bfd410e12e7532e"
     }
 ]
