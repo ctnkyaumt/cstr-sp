@@ -16,5 +16,6 @@ class CstrspPlugin: Plugin() {
         registerExtractorAPI(CstrspExtractor("https://sportsembed.su/", context))
         registerExtractorAPI(CstrspExtractor("https://roxiestreams.su/", context))
         registerExtractorAPI(CstrspExtractor("https://streamfree.top/", context))
+        registerExtractorAPI(CstrspExtractor("https://spiderembed.top/", context))
     }
 }

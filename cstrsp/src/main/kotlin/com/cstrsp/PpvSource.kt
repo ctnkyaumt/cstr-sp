@@ -47,6 +47,7 @@ data class PPVResponse(
 )
 
 object PpvSource {
+    private const val PPV_BASE = "https://ppv.st"
     private val ppvDomains = listOf("api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx", "api.ppv.to")
 
     suspend fun fetchPPVApi(): PPVResponse? = CstrspCache.cached("ppv") {
@@ -123,6 +124,12 @@ object PpvSource {
         }
     }
 
+    private fun normalizeIframeUrl(iframe: String?, uriName: String?): String? = when {
+        !iframe.isNullOrBlank() -> if (iframe.startsWith("http")) iframe else "https://embedindia.st$iframe"
+        !uriName.isNullOrBlank() -> "https://embedindia.st/embed/$uriName"
+        else -> null
+    }
+
     suspend fun loadLinks(
         data: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -136,19 +143,17 @@ object PpvSource {
 
         if (stream.id != null && (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())) {
             val iframes = mutableListOf<Pair<String, String>>()
-            val mainIframe = stream.iframe ?: stream.uri_name?.let { "https://embedindia.st/embed/$it" }
-            if (mainIframe != null) {
-                iframes.add("Main" to mainIframe)
+            normalizeIframeUrl(stream.iframe, stream.uri_name)?.let {
+                iframes.add("Main" to it)
             }
             stream.substreams?.forEach { sub ->
-                val subIframe = sub.iframe ?: sub.uri_name?.let { "https://embedindia.st/embed/$it" }
-                if (subIframe != null) {
-                    iframes.add((sub.source_tag ?: sub.name ?: sub.locale ?: "Substream") to subIframe)
+                normalizeIframeUrl(sub.iframe, sub.uri_name)?.let {
+                    iframes.add((sub.source_tag ?: sub.name ?: sub.locale ?: "Substream") to it)
                 }
             }
 
             iframes.resolveConcurrently { (name, iframeUrl) ->
-                loadExtractor(encodeUrlNonAscii(iframeUrl), "https://embedindia.st/", subtitleCallback) { link ->
+                loadExtractor(encodeUrlNonAscii(iframeUrl), "$PPV_BASE/", subtitleCallback) { link ->
                     callback(
                         ExtractorLink(
                             source = "PPV",
