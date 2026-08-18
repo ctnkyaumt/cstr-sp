@@ -52,7 +52,7 @@ class Cstrsp : MainAPI() {
     // individual mirrors by DNS, so we keep a few and pick the first that actually serves
     // data — see checkAndGetDomain. Order = preference when more than one is reachable.
     private val domains = listOf(
-        "https://streamed.pk", "https://streamed.st", "https://streamed.su", "https://streami.su"
+        "https://streamed.pk", "https://streamed.st", "https://streamed.is", "https://streamed.to", "https://streamed.cx"
     )
 
     // A mirror can pass the inexpensive match-list probe and still time out on the
@@ -683,23 +683,15 @@ class Cstrsp : MainAPI() {
         null
     }
 
-    // Shorter display dimension (video height when played in landscape). Used to cap the
-    // quality *variants* we offer to what the device can render. Int.MAX_VALUE on failure so
-    // a lookup miss never hides anything.
-    private fun deviceMaxHeight(): Int = try {
-        val dm = android.content.res.Resources.getSystem().displayMetrics
-        minOf(dm.widthPixels, dm.heightPixels)
-    } catch (_: Exception) { Int.MAX_VALUE }
+
 
     // Appends the resolved quality to a source label, e.g. "WF - alpha" -> "WF - alpha (1080p)",
     // using CloudStream's own int->label mapping so the name matches the quality badge exactly.
-    // No-op when the quality is unknown, so we never fabricate a resolution we didn't detect.
-    // The device-resolution cap is enforced as a filter in loadLinks, i.e. by dropping
-    // above-device variants — NOT by relabeling, which used to mislabel genuine 1080p
-    // streams as 720p on 720p panels. Labels always show the real stream.
+    // No-op when the quality is unknown or already contained in the string.
     private fun withQualityLabel(base: String, quality: Int): String {
         val label = Qualities.getStringByInt(quality)
-        return if (label.isEmpty()) base else "$base ($label)"
+        if (label.isEmpty() || base.contains(label, ignoreCase = true)) return base
+        return "$base ($label)"
     }
 
     // WF's quality field is typically "HD" or "SD". "HD" in standard broadcast terminology
@@ -712,13 +704,8 @@ class Cstrsp : MainAPI() {
         else -> Qualities.Unknown.value
     }
 
-    // True when a WF match has at least one playable non-SD stream — i.e. a link that
-    // loadLinks would actually keep. Matches whose only streams are SD (or that have no
-    // usable streams) are hidden from search/home, since they'd resolve to nothing HD.
-    // Mirrors the exact filter used in the WF branch of loadLinks so listing and playback
-    // never disagree.
     private fun wfHasHd(match: WFMatch): Boolean =
-        match.streams?.any { it.url != null && !"SD".equals(it.quality?.trim(), ignoreCase = true) } == true
+        match.streams?.any { !it.url.isNullOrBlank() } == true
 
     // --- "Is this event live right now?" per source ------------------------------
     // Search (and home) should only surface events that are actually in progress, not
@@ -731,12 +718,10 @@ class Cstrsp : MainAPI() {
     private fun isLiveWf(match: WFMatch): Boolean =
         match.status?.trim()?.lowercase().let { it == "in" || it == "live" }
 
-    // cdnlivetv event status uses short codes: "NS" (not started/upcoming) and "CANC"
-    // (cancelled) are the non-live ones we've observed; finished/postponed codes are added
-    // for safety. Anything else (in-play codes, or an unknown/blank status on a channel that
-    // has a playable feed) is treated as live so we never hide a genuinely live event.
+    // cdnlivetv event status: cancelled, postponed, finished codes are excluded.
+    // "NS" in cdnlivetv is used across live active sport schedules and must not be blocked.
     private val cdnNotLiveStatuses = setOf(
-        "ns", "tbd", "canc", "cancl", "cancelled", "canceled", "pst", "postp", "postponed",
+        "tbd", "canc", "cancl", "cancelled", "canceled", "pst", "postp", "postponed",
         "abd", "abandoned", "susp", "suspended", "wo", "awd", "ft", "aet", "pen", "fin", "finished", "ended"
     )
     private fun isLiveCdn(event: CdnEvent): Boolean {
@@ -1166,7 +1151,7 @@ class Cstrsp : MainAPI() {
         return (live + allToday)
             .filter { m ->
                 m.id != null && m.title != null && seen.add(m.id) &&
-                    matcher.matches(m.title, m.category)
+                    matcher.matches(m.title, m.category, m.teams?.home?.name, m.teams?.away?.name)
             }
             .mapNotNull { match ->
                 val id = match.id ?: return@mapNotNull null
@@ -1190,13 +1175,13 @@ class Cstrsp : MainAPI() {
     private suspend fun searchWf(matcher: QueryMatcher): List<SearchResponse> =
         fetchWFMatches()
             .filter { match ->
-                wfListable(match) && matcher.matches(match.title ?: "Live Event", match.sport, match.league)
+                wfListable(match) && matcher.matches(match.title ?: "Live Event", match.sport, match.league, match.teams?.home?.name, match.teams?.away?.name)
             }
             .map { wfItem(it) }
 
     private suspend fun searchCdn(matcher: QueryMatcher): List<SearchResponse> =
         fetchCdnEvents().flatMap { (sport, events) ->
-            events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport) }.map { cdnItem(it) }
+            events.filter { isLiveCdn(it) && matcher.matches(cdnTitle(it), sport, it.homeTeam, it.awayTeam, it.event) }.map { cdnItem(it) }
         }
 
     private suspend fun searchRoxie(matcher: QueryMatcher): List<SearchResponse> =
@@ -1241,7 +1226,7 @@ class Cstrsp : MainAPI() {
         if (url.startsWith("https://wf.domains/")) {
             val matchId = url.substringAfterLast("/")
             val match = fetchWFMatches().find { it.matchId == matchId } ?: return null
-            if (!wfHasHd(match)) return null
+            if (match.streams.isNullOrEmpty()) return null
             val title = match.title ?: "Live Stream"
 
             return newLiveStreamLoadResponse(
@@ -1321,43 +1306,13 @@ class Cstrsp : MainAPI() {
         originalCallback: (ExtractorLink) -> Unit
     ): Boolean {
         checkAndGetDomain()
-        val maxH = deviceMaxHeight()
-        val callback: (ExtractorLink) -> Unit = { link ->
-            try {
-                val linkHeight = when (link.quality) {
-                    Qualities.P2160.value -> 2160
-                    Qualities.P1080.value -> 1080
-                    Qualities.P720.value -> 720
-                    Qualities.P480.value -> 480
-                    Qualities.P360.value -> 360
-                    Qualities.P240.value -> 240
-                    Qualities.P144.value -> 144
-                    else -> 0
-                }
-                val is4k = linkHeight >= 2160 || 
-                           link.name.contains("4k", ignoreCase = true) || 
-                           link.name.contains("2160", ignoreCase = true) ||
-                           link.source.contains("4k", ignoreCase = true) ||
-                           link.source.contains("2160", ignoreCase = true)
-                val is1080p = linkHeight >= 1080 || 
-                              link.name.contains("1080", ignoreCase = true) || 
-                              link.name.contains("fhd", ignoreCase = true) ||
-                              link.source.contains("1080", ignoreCase = true) ||
-                              link.source.contains("fhd", ignoreCase = true)
-                val is720p = linkHeight >= 720 || 
-                             link.name.contains("720", ignoreCase = true) || 
-                             link.name.contains("hd", ignoreCase = true) ||
-                             link.source.contains("720", ignoreCase = true) ||
-                             link.source.contains("hd", ignoreCase = true)
-
-                val shouldFilter = (is4k && maxH < 2160) || (is1080p && maxH < 1080) || (is720p && maxH < 720)
-                if (!shouldFilter) {
-                    originalCallback(link)
-                }
-            } catch (e: Exception) {
-                originalCallback(link)
-            }
-        }
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        checkAndGetDomain()
         if (data == TRT_URL) {
             callback.invoke(
                 ExtractorLink(
@@ -1416,13 +1371,10 @@ class Cstrsp : MainAPI() {
                 // a WebView extractor. Prefer the match-specific sources over the "prime"
                 // channel dump, whose per-channel feeds sometimes carry an unrelated event.
                 val streams = match.streams
-                    .filter { it.url != null && !"SD".equals(it.quality, ignoreCase = true) }
-                    .sortedBy { it.source == "prime" }
+                    .filter { !it.url.isNullOrBlank() }
+                    .sortedByDescending { !"SD".equals(it.quality?.trim(), ignoreCase = true) }
                     .take(15)
                 streams.resolveConcurrently { stream ->
-                    // Build the label from source + language only; the resolution is appended
-                    // from the *detected* quality below, not from WF's static quality hint
-                    // (which is what was mislabeling 1080p feeds as 720p).
                     val base = listOfNotNull(stream.source, stream.language).joinToString(" - ").ifBlank { "Live" }
                     // Referer is the wrapper page, mirroring what the browser sends the inner player.
                     val embed = encodeUrlNonAscii(unwrapWfEmbed(stream.url!!))
@@ -1438,10 +1390,11 @@ class Cstrsp : MainAPI() {
                                 resolvedQuality = Qualities.P1080.value
                             }
                         }
+                        val labeled = withQualityLabel("WF - $base", resolvedQuality)
                         callback(
                             ExtractorLink(
                                 source = "WF",
-                                name = "WF - $base",
+                                name = labeled,
                                 url = link.url,
                                 referer = link.referer,
                                 quality = resolvedQuality,
@@ -1660,20 +1613,23 @@ class Cstrsp : MainAPI() {
         embeds.resolveConcurrently { (source, stream) ->
             val langStr = stream.language ?: "Unknown"
             val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
-            val base = "$sourceName - $langStr - Stream ${stream.streamNo ?: "?"}"
+            val hdTag = if (stream.hd) " [HD]" else " [SD]"
+            val base = "$sourceName - $langStr - Stream ${stream.streamNo ?: "?"}$hdTag"
             // Pass the embed URL to our WebView extractor (or built-in extractors)
             loadExtractor(encodeUrlNonAscii(stream.embedUrl!!), "$mainUrl/", subtitleCallback) { link ->
-                // Trust the extractor's detected resolution (from the master playlist).
-                // When it can't be determined we leave it Unknown rather than guessing
-                // 720p, so we never label a stream with a resolution we didn't measure.
-                val labeled = withQualityLabel(base, link.quality)
+                val resolvedQuality = when {
+                    link.quality != Qualities.Unknown.value -> link.quality
+                    stream.hd -> Qualities.P1080.value
+                    else -> Qualities.P480.value
+                }
+                val labeled = withQualityLabel(base, resolvedQuality)
                 callback.invoke(
                     ExtractorLink(
                         source = labeled,
                         name = labeled,
                         url = link.url,
                         referer = link.referer,
-                        quality = link.quality,
+                        quality = resolvedQuality,
                         type = link.type,
                         headers = link.headers,
                         extractorData = link.extractorData
