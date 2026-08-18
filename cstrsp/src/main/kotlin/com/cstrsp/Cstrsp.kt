@@ -270,6 +270,22 @@ class Cstrsp : MainAPI() {
         @JsonProperty("cdn-live-tv") val data: Map<String, Any?>? = null
     )
 
+    // streamfree.top API
+    data class StreamfreeStream(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("category") val category: String? = null,
+        @JsonProperty("league") val league: String? = null,
+        @JsonProperty("stream_key") val streamKey: String? = null,
+        @JsonProperty("match_timestamp") val matchTimestamp: Long? = null,
+        @JsonProperty("embed_url") val embedUrl: String? = null,
+        @JsonProperty("thumbnail_url") val thumbnailUrl: String? = null
+    )
+
+    data class StreamfreeResponse(
+        @JsonProperty("count") val count: Int? = null,
+        @JsonProperty("streams") val streams: List<StreamfreeStream>? = null
+    )
+
     // roxiestreams.su has no API — it's server-rendered HTML. An event is a row in the
     // homepage "Upcoming Events" table; `path` is the relative link to its stream page.
     data class RoxieEvent(
@@ -585,17 +601,40 @@ class Cstrsp : MainAPI() {
         "Sec-Fetch-Site" to "cross-site"
     )
 
-    // The homepage "Upcoming Events" table, one card per row. Cached; shared by home/search/load.
+    private val roxieCategories = listOf("/soccer", "/mlb", "/nba", "/nfl", "/nhl", "/fighting", "/motorsports")
+
+    // Scrapes events across homepage + all category subpages (/soccer, /mlb, /nba, etc.)
     private suspend fun fetchRoxieEvents(): List<RoxieEvent> = cached("roxie-events") {
-        val html = app.get("$roxieUrl/", referer = "$roxieUrl/").text
-        val table = html.substringAfter("id=\"eventsTable\"", "").substringBefore("</table>", "")
-        if (table.isBlank()) return@cached null
-        roxieEventRowRegex.findAll(table)
-            .map { RoxieEvent(it.groupValues[2].trim(), it.groupValues[1].trim()) }
-            .filter { it.name.isNotBlank() && it.path.isNotBlank() }
-            .distinctBy { it.path }
-            .toList()
-            .takeIf { it.isNotEmpty() }
+        val pages = listOf("/") + roxieCategories
+        val results = coroutineScope {
+            pages.map { pagePath ->
+                async {
+                    try {
+                        val html = app.get("$roxieUrl$pagePath", referer = "$roxieUrl/").text
+                        val table = if (html.contains("id=\"eventsTable\"")) {
+                            html.substringAfter("id=\"eventsTable\"", "").substringBefore("</table>", "")
+                        } else html
+                        roxieEventRowRegex.findAll(table)
+                            .map { RoxieEvent(it.groupValues[2].trim(), it.groupValues[1].trim()) }
+                            .filter { ev ->
+                                ev.name.isNotBlank() && ev.path.isNotBlank() &&
+                                    ev.path !in pages && ev.path != "/multiview" && !ev.path.endsWith(".txt")
+                            }
+                            .toList()
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+                }
+            }.awaitAll().flatten()
+        }
+        results.distinctBy { it.path }.takeIf { it.isNotEmpty() }
+    } ?: emptyList()
+
+    private val streamfreeUrl = "https://streamfree.top"
+
+    private suspend fun fetchStreamfreeStreams(): List<StreamfreeStream> = cached("streamfree") {
+        app.get("$streamfreeUrl/api/v1/streams").parsedSafe<StreamfreeResponse>()?.streams
+            ?.filter { !it.name.isNullOrBlank() && !it.embedUrl.isNullOrBlank() }
     } ?: emptyList()
 
     // The CDN host pool for direct m3u8 playback (newline-separated, with duplicates). The
@@ -808,6 +847,11 @@ class Cstrsp : MainAPI() {
 
     private fun roxieItem(event: RoxieEvent): SearchResponse =
         newLiveSearchResponse("${event.name} [Roxie]", "https://roxie.domains/${roxieKey(event.path)}") {}
+
+    private fun streamfreeItem(stream: StreamfreeStream): SearchResponse =
+        newLiveSearchResponse("${stream.name ?: "Live Event"} [StreamFree]", "https://streamfree.domains/${stream.streamKey ?: stream.name}") {
+            this.posterUrl = stream.thumbnailUrl
+        }
 
     // Resolves candidates (WebView-based loadExtractor calls) with bounded concurrency
     // instead of one at a time. Each call can take up to ~15s to time out, so resolving a
@@ -1049,12 +1093,11 @@ class Cstrsp : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         checkAndGetDomain()
-        // All five upstreams fetched concurrently — one slow or dead source no longer
-        // delays the whole home page. awaitAll preserves order, so sections stay stable:
-        // Streamed, PPV, WF, StreamSports, Roxie.
+        // All upstreams fetched concurrently
         val sections = coroutineScope {
             listOf(
                 async { safeList { streamedHomeSections() } },
+                async { safeList { streamfreeHomeSections() } },
                 async { safeList { ppvHomeSections() } },
                 async { safeList { wfHomeSections() } },
                 async { safeList { cdnHomeSections() } },
@@ -1077,6 +1120,13 @@ class Cstrsp : MainAPI() {
                 }
                 if (items.isEmpty()) null
                 else HomePageList("${category.replaceFirstChar { it.uppercase() }} [Streamed]", items)
+            }
+
+    private suspend fun streamfreeHomeSections(): List<HomePageList> =
+        fetchStreamfreeStreams()
+            .groupBy { it.category?.replaceFirstChar { c -> c.uppercase() } ?: "Live" }
+            .map { (cat, streams) ->
+                HomePageList("$cat [StreamFree]", streams.map { streamfreeItem(it) })
             }
 
     private suspend fun ppvHomeSections(): List<HomePageList> =
@@ -1103,7 +1153,7 @@ class Cstrsp : MainAPI() {
             else HomePageList("${sport.replaceFirstChar { it.uppercase() }} [StreamSports]", items)
         }
 
-    // roxiestreams has a small hand-curated slate, so one flat [Roxie] section is enough.
+    // roxiestreams has a curated slate across sports categories
     private suspend fun roxieHomeSections(): List<HomePageList> {
         val items = fetchPlayableRoxieEvents().map { roxieItem(it) }
         return if (items.isEmpty()) emptyList() else listOf(HomePageList("Live Events [Roxie]", items))
@@ -1122,10 +1172,11 @@ class Cstrsp : MainAPI() {
             }
         )
 
-        // Same concurrency + ordering rationale as getMainPage.
+        // All upstreams searched concurrently
         coroutineScope {
             listOf(
                 async { safeList { searchStreamed(matcher) } },
+                async { safeList { searchStreamfree(matcher) } },
                 async { safeList { searchPpv(matcher) } },
                 async { safeList { searchWf(matcher) } },
                 async { safeList { searchCdn(matcher) } },
@@ -1136,12 +1187,7 @@ class Cstrsp : MainAPI() {
         return results
     }
 
-    // Streamed.pk search. Home uses /matches/live only, but Streamed's live flag is
-    // unreliable: some genuinely-live events (an F1 race, e.g. the Belgian GP) never appear
-    // in /live and only exist in /all-today, sometimes with a stale/null start time. So for
-    // search we union both and dedupe (live entries win), dropping only entries that are
-    // clearly in the future (tomorrow's schedule) — a null/past date is kept, so an event
-    // with broken metadata is still findable rather than silently missing.
+    // Streamed.pk search
     private suspend fun searchStreamed(matcher: QueryMatcher): List<SearchResponse> {
         val live = fetchMatches("$apiUrl/matches/live")
         val futureCutoff = System.currentTimeMillis() + 12 * 3_600_000L
@@ -1161,6 +1207,11 @@ class Cstrsp : MainAPI() {
                 }
             }
     }
+
+    private suspend fun searchStreamfree(matcher: QueryMatcher): List<SearchResponse> =
+        fetchStreamfreeStreams()
+            .filter { matcher.matches(it.name, it.category, it.league) }
+            .map { streamfreeItem(it) }
 
     private suspend fun searchPpv(matcher: QueryMatcher): List<SearchResponse> =
         fetchPPVApi()?.streams.orEmpty().flatMap { category ->
@@ -1201,6 +1252,21 @@ class Cstrsp : MainAPI() {
             ) {
                 this.posterUrl = TRT_POSTER
                 this.plot = "TRT Yayını Live Stream"
+            }
+        }
+
+        // Handle StreamFree Streams
+        if (url.startsWith("https://streamfree.domains/")) {
+            val key = url.substringAfterLast("/")
+            val stream = fetchStreamfreeStreams().find { it.streamKey == key || it.name == key } ?: return null
+            val title = stream.name ?: "Live Stream"
+            return newLiveStreamLoadResponse(
+                name = "$title [StreamFree]",
+                url = url,
+                dataUrl = stream.toJson()
+            ) {
+                this.posterUrl = stream.thumbnailUrl
+                this.plot = title
             }
         }
 
@@ -1303,13 +1369,6 @@ class Cstrsp : MainAPI() {
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
-        originalCallback: (ExtractorLink) -> Unit
-    ): Boolean {
-        checkAndGetDomain()
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         checkAndGetDomain()
@@ -1326,6 +1385,72 @@ class Cstrsp : MainAPI() {
             )
             return true
         }
+
+        // Handle StreamFree Extract
+        try {
+            val stream = AppUtils.parseJson<StreamfreeStream>(data)
+            if (!stream.embedUrl.isNullOrBlank()) {
+                val embedUrl = stream.embedUrl
+                val refererUrl = "$streamfreeUrl/${stream.category ?: "live"}/${stream.streamKey ?: ""}"
+                val embedHtml = try {
+                    app.get(embedUrl, referer = refererUrl).text
+                } catch (e: Exception) { null }
+
+                var foundDirect = false
+                if (embedHtml != null) {
+                    val m0x = Regex("""const\s+_0x\s*=\s*(\{.*?\});""").find(embedHtml)
+                    if (m0x != null) {
+                        try {
+                            val mapType = object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Map<String, Any>>>() {}
+                            val qMap = AppUtils.mapper.readValue<Map<String, Map<String, Any>>>(m0x.groupValues[1], mapType)
+                            for ((q, params) in qMap) {
+                                val t = params["_t"]?.toString() ?: continue
+                                val e = params["_e"]?.toString() ?: continue
+                                val n = params["_n"]?.toString() ?: continue
+                                val directUrl = "$streamfreeUrl/live/${stream.streamKey}$q/index.m3u8?_t=$t&_e=$e&_n=$n"
+                                val quality = when (q.lowercase()) {
+                                    "2160p", "4k" -> Qualities.P2160.value
+                                    "1080p" -> Qualities.P1080.value
+                                    "720p" -> Qualities.P720.value
+                                    "540p" -> Qualities.P480.value
+                                    else -> Qualities.Unknown.value
+                                }
+                                val labeled = withQualityLabel("StreamFree - $q", quality)
+                                callback.invoke(
+                                    ExtractorLink(
+                                        source = "StreamFree",
+                                        name = labeled,
+                                        url = directUrl,
+                                        referer = "$streamfreeUrl/",
+                                        quality = quality,
+                                        type = ExtractorLinkType.M3U8
+                                    )
+                                )
+                                foundDirect = true
+                            }
+                        } catch (e: Exception) {}
+                    }
+                }
+
+                if (!foundDirect) {
+                    loadExtractor(encodeUrlNonAscii(embedUrl), refererUrl, subtitleCallback) { link ->
+                        callback(
+                            ExtractorLink(
+                                source = "StreamFree",
+                                name = withQualityLabel("StreamFree - ${stream.name}", link.quality),
+                                url = link.url,
+                                referer = link.referer,
+                                quality = link.quality,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData
+                            )
+                        )
+                    }
+                }
+                return true
+            }
+        } catch (e: Exception) {}
 
         // Handle PPV Extract
         try {
