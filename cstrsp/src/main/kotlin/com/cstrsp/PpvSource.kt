@@ -14,6 +14,17 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 
+data class PPVSourceItem(
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("type") val type: String? = null,
+    @JsonProperty("data") val data: String? = null
+)
+
+data class PPVStreamDetailResponse(
+    @JsonProperty("success") val success: Boolean? = null,
+    @JsonProperty("data") val data: PPVStream? = null
+)
+
 data class PPVSubstream(
     @JsonProperty("id") val id: Int? = null,
     @JsonProperty("name") val name: String? = null,
@@ -29,6 +40,11 @@ data class PPVStream(
     @JsonProperty("poster") val poster: String? = null,
     @JsonProperty("iframe") val iframe: String? = null,
     @JsonProperty("uri_name") val uri_name: String? = null,
+    @JsonProperty("uri") val uri: String? = null,
+    @JsonProperty("tag") val tag: String? = null,
+    @JsonProperty("source_tag") val source_tag: String? = null,
+    @JsonProperty("locale") val locale: String? = null,
+    @JsonProperty("sources") val sources: List<PPVSourceItem>? = null,
     @JsonProperty("starts_at") val startsAt: Long? = null,
     @JsonProperty("ends_at") val endsAt: Long? = null,
     @JsonProperty("always_live") val alwaysLive: Int? = null,
@@ -48,12 +64,22 @@ data class PPVResponse(
 
 object PpvSource {
     private const val PPV_BASE = "https://ppv.st"
-    private val ppvDomains = listOf("api.ppv.st", "api.ppv.is", "api.ppv.lc", "api.ppv.cx", "api.ppv.to")
+    private val ppvDomains = listOf("api.ppv.st", "api.ppv.cx", "api.ppv.lc", "api.ppv.to", "api.ppv.is")
 
     suspend fun fetchPPVApi(): PPVResponse? = CstrspCache.cached("ppv") {
         ppvDomains.firstNotNullOfOrNull { domain ->
             try {
-                app.get("https://$domain/api/streams").parsedSafe<PPVResponse>()?.takeIf { it.streams != null }
+                app.get("https://$domain/api/streams", referer = "$PPV_BASE/").parsedSafe<PPVResponse>()?.takeIf { it.streams != null }
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
+    suspend fun fetchPPVStream(streamId: Int): PPVStream? = CstrspCache.cached("ppv-stream-$streamId") {
+        ppvDomains.firstNotNullOfOrNull { domain ->
+            try {
+                app.get("https://$domain/api/streams/$streamId", referer = "$PPV_BASE/").parsedSafe<PPVStreamDetailResponse>()?.data
             } catch (e: Exception) {
                 null
             }
@@ -65,22 +91,18 @@ object PpvSource {
         val now = System.currentTimeMillis() / 1000L
         val start = stream.startsAt ?: 0L
         val end = stream.endsAt ?: 0L
-        if (start > 0L && now < start) return false
+        if (start > 0L && now < start - 1800L) return false
         if (end > 0L && now > end + 1800L) return false
         return true
     }
 
     fun ppvPoster(stream: PPVStream): String? = stream.poster?.let {
-        val encoded = android.util.Base64.encodeToString(
-            it.toByteArray(),
-            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
-        )
-        "${StreamedSource.mainUrl}/api/images/proxy/$encoded.webp"
+        if (it.startsWith("http")) it else "$PPV_BASE$it"
     }
 
     fun ppvListable(category: PPVCategory, stream: PPVStream): Boolean =
         stream.id != null && isLivePpv(category, stream) &&
-            (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())
+            (stream.iframe != null || stream.uri_name != null || stream.uri != null || !stream.sources.isNullOrEmpty() || !stream.substreams.isNullOrEmpty())
 
     fun ppvItem(api: MainAPI, stream: PPVStream): SearchResponse =
         api.newLiveSearchResponse("${stream.name ?: "Unknown Event"} [PPV]", "https://ppv.domains/${stream.id}") {
@@ -96,21 +118,34 @@ object PpvSource {
             else HomePageList("${category.category_name ?: category.category ?: "Unknown"} [PPV]", items)
         }
 
-    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> =
-        fetchPPVApi()?.streams.orEmpty().flatMap { category ->
+    suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> {
+        val now = System.currentTimeMillis() / 1000L
+        val seen = HashSet<Int>()
+        return fetchPPVApi()?.streams.orEmpty().flatMap { category ->
             category.streams.orEmpty()
                 .filter { stream ->
-                    ppvListable(category, stream) &&
-                        matcher.matches(stream.name ?: "Unknown Event", category.category_name, category.category)
+                    val id = stream.id ?: return@filter false
+                    val end = stream.endsAt ?: 0L
+                    val notEnded = category.alwaysLive == true || (stream.alwaysLive ?: 0) == 1 || end == 0L || now <= end + 1800L
+                    notEnded && seen.add(id) &&
+                        matcher.matches(
+                            stream.name ?: "Unknown Event",
+                            stream.source_tag,
+                            stream.tag,
+                            category.category_name,
+                            category.category
+                        )
                 }
                 .map { ppvItem(api, it) }
         }
+    }
 
     suspend fun load(api: MainAPI, url: String): LoadResponse? {
         if (!url.startsWith("https://ppv.domains/")) return null
-        val streamId = url.substringAfterLast("/").toIntOrNull()
+        val streamId = url.substringAfterLast("/").toIntOrNull() ?: return null
         val stream = fetchPPVApi()?.streams
             ?.firstNotNullOfOrNull { category -> category.streams?.find { it.id == streamId } }
+            ?: fetchPPVStream(streamId)
             ?: return null
         val title = stream.name ?: "Live Stream"
 
@@ -125,9 +160,24 @@ object PpvSource {
     }
 
     private fun normalizeIframeUrl(iframe: String?, uriName: String?): String? = when {
-        !iframe.isNullOrBlank() -> if (iframe.startsWith("http")) iframe else "https://embedindia.st$iframe"
+        !iframe.isNullOrBlank() -> when {
+            iframe.startsWith("http://") || iframe.startsWith("https://") -> iframe
+            iframe.startsWith("//") -> "https:$iframe"
+            iframe.startsWith("/") -> "https://embedindia.st$iframe"
+            else -> "https://embedindia.st/$iframe"
+        }
         !uriName.isNullOrBlank() -> "https://embedindia.st/embed/$uriName"
         else -> null
+    }
+
+    private fun buildStreamLabel(sourceTag: String, locale: String?): String {
+        val cleanTag = sourceTag.trim()
+        val cleanLocale = locale?.trim()?.uppercase()
+        return if (!cleanLocale.isNullOrEmpty() && !cleanTag.contains(cleanLocale, ignoreCase = true)) {
+            "$cleanTag [$cleanLocale]"
+        } else {
+            cleanTag
+        }
     }
 
     suspend fun loadLinks(
@@ -141,35 +191,49 @@ object PpvSource {
             return false
         }
 
-        if (stream.id != null && (stream.iframe != null || stream.uri_name != null || !stream.substreams.isNullOrEmpty())) {
-            val iframes = mutableListOf<Pair<String, String>>()
-            normalizeIframeUrl(stream.iframe, stream.uri_name)?.let {
-                iframes.add("Main" to it)
-            }
-            stream.substreams?.forEach { sub ->
-                normalizeIframeUrl(sub.iframe, sub.uri_name)?.let {
-                    iframes.add((sub.source_tag ?: sub.name ?: sub.locale ?: "Substream") to it)
-                }
-            }
-
-            iframes.resolveConcurrently { (name, iframeUrl) ->
-                loadExtractor(encodeUrlNonAscii(iframeUrl), "$PPV_BASE/", subtitleCallback) { link ->
-                    callback(
-                        ExtractorLink(
-                            source = "PPV",
-                            name = withQualityLabel("PPV - $name", link.quality),
-                            url = link.url,
-                            referer = link.referer,
-                            quality = link.quality,
-                            type = link.type,
-                            headers = link.headers,
-                            extractorData = link.extractorData
-                        )
-                    )
-                }
-            }
-            return true
+        val streamId = stream.id ?: return false
+        val fullStream = if (stream.iframe.isNullOrBlank() && stream.sources.isNullOrEmpty() && stream.substreams.isNullOrEmpty() && stream.uri_name.isNullOrBlank() && stream.uri.isNullOrBlank()) {
+            fetchPPVStream(streamId) ?: stream
+        } else {
+            stream
         }
-        return false
+
+        val iframes = mutableListOf<Pair<String, String>>()
+        val mainIframe = fullStream.iframe
+            ?: fullStream.sources?.firstOrNull { it.type == "iframe" || it.data?.contains("embed") == true }?.data
+            ?: fullStream.sources?.firstOrNull()?.data
+        val mainUri = fullStream.uri_name ?: fullStream.uri
+        normalizeIframeUrl(mainIframe, mainUri)?.let {
+            val label = buildStreamLabel(fullStream.source_tag ?: "Main", fullStream.locale)
+            iframes.add(label to it)
+        }
+
+        fullStream.substreams?.forEach { sub ->
+            normalizeIframeUrl(sub.iframe, sub.uri_name)?.let {
+                val label = buildStreamLabel(sub.source_tag ?: sub.name ?: "Substream", sub.locale)
+                iframes.add(label to it)
+            }
+        }
+
+        if (iframes.isEmpty()) return false
+
+        iframes.distinctBy { it.second }.resolveConcurrently { (name, iframeUrl) ->
+            loadExtractor(encodeUrlNonAscii(iframeUrl), "$PPV_BASE/", subtitleCallback) { link ->
+                callback(
+                    ExtractorLink(
+                        source = "PPV",
+                        name = withQualityLabel("PPV - $name", link.quality),
+                        url = link.url,
+                        referer = link.referer,
+                        quality = link.quality,
+                        type = link.type,
+                        headers = link.headers,
+                        extractorData = link.extractorData
+                    )
+                )
+            }
+        }
+        return true
     }
 }
+
