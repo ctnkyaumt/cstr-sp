@@ -2,6 +2,7 @@ package com.cstrsp
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -25,10 +26,6 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
     override val name            = "Cstrsp Extractor (${mainUrl.substringAfter("://").substringBefore("/")})"
     override val requiresReferer = false
 
-    // A playlist URL the sniffer saw, tagged with the order its request was issued in.
-    // isMaster: true = confirmed master playlist (#EXT-X-STREAM-INF seen or "master" in
-    // the URL), false = confirmed media/variant playlist, null = captured blind (URL
-    // contained ".m3u", body never probed).
     private data class Candidate(
         val seq: Int,
         val url: String,
@@ -37,33 +34,60 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
         val maxHeight: Int? = null
     )
 
+    private fun triggerPlayback(view: WebView?) {
+        view?.evaluateJavascript(
+            """
+            (function() {
+                try {
+                    if (window.jwplayer && typeof window.jwplayer === 'function') {
+                        try { window.jwplayer().play(); } catch(e){}
+                    }
+                    const videos = document.querySelectorAll('video');
+                    videos.forEach(function(v) {
+                        try {
+                            v.muted = true;
+                            v.play();
+                        } catch(e) {}
+                    });
+                    const selectors = [
+                        '.jw-display-icon-display',
+                        '.jw-icon-playback',
+                        '.jw-preview',
+                        '.player-poster',
+                        '#player',
+                        'button.play',
+                        '.play-btn',
+                        '[class*="play"]',
+                        '[id*="play"]'
+                    ];
+                    selectors.forEach(function(sel) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            try { el.click(); } catch(e) {}
+                        }
+                    });
+                } catch(e) {}
+            })();
+            """.trimIndent(),
+            null
+        )
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        // Local, not a class field: this extractor is registered once per domain and
-        // reused, and loadLinks now resolves multiple candidate streams concurrently.
-        // Several of them often share the same embed domain (e.g. one source's stream
-        // numbers 1-6 can all route through embed.st), so a shared webView field would
-        // have one call's cleanup destroy another call's in-flight WebView.
         lateinit var webView: WebView
-        // Don't finish on the first playlist that resolves. HLS players request the
-        // master playlist (all resolutions) before any single-quality variant, but when
-        // the master's URL doesn't contain ".m3u" it is only detected via a slow network
-        // probe, while the variant's ".m3u8" URL is captured instantly — so first-wins
-        // locked playback to one quality (usually 720p) with no resolution switching.
-        // Instead we collect every candidate for a short grace window and then pick a
-        // confirmed master first, falling back to the earliest-requested candidate.
         val selectionDone = AtomicBoolean(false)
         val requestSeq = AtomicInteger(0)
         val candidates = ConcurrentLinkedQueue<Candidate>()
         val firstCaptureAt = AtomicLong(0L)
-        // Captured on the main thread; shouldInterceptRequest runs on a background thread
-        // where calling any WebView method (e.g. settings.userAgentString) would crash.
         var cachedUserAgent: String? = null
+
         withContext(Dispatchers.Main) {
             webView = WebView(context).apply {
                 settings.apply {
                     javaScriptEnabled                  = true
                     domStorageEnabled                  = true
+                    databaseEnabled                    = true
                     javaScriptCanOpenWindowsAutomatically = true
                     loadWithOverviewMode               = true
                     useWideViewPort                    = true
@@ -75,29 +99,24 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                     mixedContentMode                   = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 }
                 cachedUserAgent = settings.userAgentString
+                webChromeClient = WebChromeClient()
 
                 webViewClient = object : WebViewClient() {
-                    // These embed pages are ad-heavy and some fire a forced top-frame
-                    // navigation (e.g. to a data: URI) within a second of load, which tears
-                    // down the page's own player script before it ever requests the real
-                    // stream. Block anything that isn't a normal http(s) navigation so the
-                    // player keeps running; this never affects the initial loadUrl() below,
-                    // since shouldOverrideUrlLoading only fires for navigations the WebView
-                    // itself initiates afterwards.
                     override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                         val scheme = request?.url?.scheme?.lowercase()
                         if (scheme != null && scheme != "http" && scheme != "https") return true
 
-                        // Player/ad scripts regularly replace the top frame with /ad.html,
-                        // about:blank, data: payloads, or an off-site ad before HLS is requested.
-                        // Subframe navigation remains allowed; only keep the original player in
-                        // control of the WebView's main frame (fragment changes are harmless).
                         if (request?.isForMainFrame == true) {
                             val requested = request.url.toString().substringBefore('#')
                             val initial = url.substringBefore('#')
                             if (requested != initial) return true
                         }
                         return false
+                    }
+
+                    override fun onPageFinished(view: WebView?, finishedUrl: String?) {
+                        super.onPageFinished(view, finishedUrl)
+                        triggerPlayback(view)
                     }
 
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
@@ -109,36 +128,29 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         }
 
                         @Suppress("NAME_SHADOWING") val reqUrl = request?.url.toString()
-                        val isPlaylistUrl = reqUrl.contains(".m3u")
-                        // Cheap URL pre-filter: static assets and media segments can never
-                        // be a playlist, so don't spawn a probe thread for them — these
-                        // ad-heavy embed pages fire hundreds of such requests.
+                        val isPlaylistUrl = reqUrl.contains(".m3u", ignoreCase = true) ||
+                            reqUrl.contains(".mpd", ignoreCase = true) ||
+                            reqUrl.contains("/hls/", ignoreCase = true) ||
+                            reqUrl.contains("manifest", ignoreCase = true) ||
+                            reqUrl.contains("playlist", ignoreCase = true)
+
                         if (!isPlaylistUrl && isStaticAsset(reqUrl)) {
                             return super.shouldInterceptRequest(view, request)
                         }
 
                         val headers = request?.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                        // Issue order of the request, not completion order of the probe:
-                        // this is what lets an earlier master beat a faster variant.
                         val seq = requestSeq.getAndIncrement()
 
-                        // Add WebView cookies to the headers so ExoPlayer can use them
                         val cookie = android.webkit.CookieManager.getInstance().getCookie(reqUrl)
                         if (cookie != null) {
                             headers["Cookie"] = cookie
                         }
 
-                        // Ensure User-Agent is present. Use the value cached on the main
-                        // thread — never touch view.settings here (background thread).
                         if (!headers.containsKey("User-Agent") && !headers.containsKey("user-agent")) {
                             headers["User-Agent"] = cachedUserAgent ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                         }
 
                         if (isPlaylistUrl) {
-                            // Captured blind, without fetching the body: probing could consume
-                            // a one-time playback token and break the URL for ExoPlayer.
-                            // "master" in the URL is a safe hint; anything else stays unknown.
-                            // No network involved, so no thread needed either.
                             val isMaster = if (reqUrl.contains("master", ignoreCase = true)) true else null
                             candidates.add(Candidate(seq, reqUrl, headers, isMaster, null))
                             firstCaptureAt.compareAndSet(0L, System.currentTimeMillis())
@@ -168,29 +180,29 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
         try {
             var waitTime = 0
             while (waitTime < 15000) {
-                delay(200)
-                waitTime += 200
+                delay(250)
+                waitTime += 250
+
+                if (waitTime % 1000 == 0) {
+                    withContext(Dispatchers.Main) {
+                        try {
+                            triggerPlayback(webView)
+                        } catch (e: Exception) {}
+                    }
+                }
+
                 val first = firstCaptureAt.get()
                 if (first == 0L) continue
-                // A confirmed master is decisive. Otherwise hold a short grace window
-                // from the first capture so a slower-probing master can still land.
                 val hasMaster = candidates.any { it.isMaster == true }
                 if (hasMaster || System.currentTimeMillis() - first >= GRACE_MS) {
                     break
                 }
             }
-            // Also reached on timeout: take whatever arrived even if the grace window
-            // hadn't elapsed yet (a late capture is still better than none).
             selectionDone.set(true)
             val pageOrigin = runCatching {
                 URL(url).let { "${it.protocol}://${it.host}" }
             }.getOrNull()
-            // WebView strips Referer/Origin from requestHeaders for JS-issued (XHR/fetch)
-            // requests, so the captured headers usually carry neither. Hotlink-protected CDNs
-            // then reject ExoPlayer's request with 403 — surfacing as playback error 2004
-            // (ERROR_CODE_IO_BAD_HTTP_STATUS) even though a link was found. Fill in what a
-            // browser sends for a cross-origin media request. Anything the WebView did
-            // provide wins.
+
             fun headersFor(c: Candidate): Pair<String, Map<String, String>> {
                 val out = c.headers.toMutableMap()
                 val ref = out.entries.firstOrNull { it.key.equals("Referer", true) }?.value
@@ -201,26 +213,21 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                 }
                 return ref to out
             }
-            // Preference order: confirmed master, then blind-captured, then a known variant;
-            // earliest-requested first within each tier.
+
             val ordered = (
                 candidates.filter { it.isMaster == true }.sortedBy { it.seq } +
                     candidates.filter { it.isMaster == null }.sortedBy { it.seq } +
                     candidates.filter { it.isMaster == false }.sortedBy { it.seq }
                 ).distinctBy { it.url }
-            // Deliberately NOT probed. These playlist URLs are frequently single-use: fetching
-            // one here consumes its token, so the player's own request then fails with 403 —
-            // which showed up as *every* PPV link erroring with 2004. Blind capture is the
-            // whole reason the URL stays valid for playback. (Roxie is different and is
-            // verified in the provider, since those manifests are ordinary re-fetchable ones.)
+
             ordered.firstOrNull()?.let { c ->
-                val (referer, outHeaders) = headersFor(c)
+                val (ref, outHeaders) = headersFor(c)
                 callback.invoke(
                     ExtractorLink(
                         source  = this@CstrspExtractor.name,
                         name    = this@CstrspExtractor.name,
                         url     = c.url,
-                        referer = referer,
+                        referer = ref,
                         quality = heightToQuality(c.maxHeight),
                         type    = ExtractorLinkType.M3U8,
                         headers = outHeaders
@@ -237,8 +244,6 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
         }
     }
 
-    // Probes a URL that *might* be a playlist served without ".m3u" in its path: fetches
-    // the head of the body and captures it only when it turns out to be an HLS playlist.
     private fun probePlaylist(url: String, headers: Map<String, String>?, onResponseCaptured: (url: String, headers: Map<String, String>, isMaster: Boolean?, maxHeight: Int?) -> Unit) {
         try {
             val connection = URL(url).openConnection() as HttpURLConnection
@@ -250,7 +255,15 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                 connection.setRequestProperty(key, value)
             }
 
-            // Add WebView cookies
+            if (headers?.keys?.none { it.equals("Referer", true) } == true) {
+                connection.setRequestProperty("Referer", mainUrl)
+            }
+            if (headers?.keys?.none { it.equals("Origin", true) } == true) {
+                runCatching { URL(mainUrl).let { "${it.protocol}://${it.host}" } }.getOrNull()?.let {
+                    connection.setRequestProperty("Origin", it)
+                }
+            }
+
             val cookieManager = android.webkit.CookieManager.getInstance()
             val cookies = cookieManager.getCookie(url)
             if (cookies != null) {
@@ -262,10 +275,6 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
             val contentType = connection.contentType ?: ""
             val typeIsM3u8 = contentType.contains("mpegurl", ignoreCase = true)
 
-            // Read the first chunk to (a) confirm it's a playlist when the Content-Type
-            // is generic and (b) classify master vs variant: masters carry
-            // #EXT-X-STREAM-INF entries, media playlists carry #EXTINF segments.
-            // Masters are tiny, so 8KB is plenty to find the marker.
             val reader = BufferedReader(InputStreamReader(connection.inputStream))
             val head = CharArray(8192)
             var total = 0
@@ -294,15 +303,12 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
     companion object {
         private const val GRACE_MS = 2000L
         private val RESOLUTION_REGEX = Regex("""RESOLUTION=\d+x(\d+)""")
-        // Extensions that can never be an HLS playlist. ".ts"/".m4s"/".mp4" are media
-        // segments; playlist URLs are caught earlier by the ".m3u" check.
         private val SKIP_EXTENSIONS = arrayOf(
             ".js", ".css", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".ico",
             ".woff", ".woff2", ".ttf", ".otf", ".ts", ".m4s", ".mp4", ".webm",
             ".mp3", ".aac", ".wasm", ".map"
         )
 
-        // Checked against the path only, so query strings ("logo.png?v=2") can't dodge it.
         private fun isStaticAsset(url: String): Boolean {
             val path = url.substringBefore('?').substringBefore('#')
             return path.endsWith("/fetch") || SKIP_EXTENSIONS.any { path.endsWith(it, ignoreCase = true) }

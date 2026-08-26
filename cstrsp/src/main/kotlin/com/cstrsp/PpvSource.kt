@@ -120,20 +120,19 @@ object PpvSource {
 
     suspend fun search(api: MainAPI, matcher: QueryMatcher): List<SearchResponse> {
         val now = System.currentTimeMillis() / 1000L
-        val seen = HashSet<Int>()
+        val seen = HashSet<String>()
         return fetchPPVApi()?.streams.orEmpty().flatMap { category ->
             category.streams.orEmpty()
                 .filter { stream ->
                     val id = stream.id ?: return@filter false
+                    val title = stream.name ?: "Unknown Event"
                     val end = stream.endsAt ?: 0L
                     val notEnded = category.alwaysLive == true || (stream.alwaysLive ?: 0) == 1 || end == 0L || now <= end + 1800L
-                    notEnded && seen.add(id) &&
+                    notEnded && seen.add("$id-$title") &&
                         matcher.matches(
-                            stream.name ?: "Unknown Event",
+                            title,
                             stream.source_tag,
-                            stream.tag,
-                            category.category_name,
-                            category.category
+                            stream.tag
                         )
                 }
                 .map { ppvItem(api, it) }
@@ -207,11 +206,27 @@ object PpvSource {
             val label = buildStreamLabel(fullStream.source_tag ?: "Main", fullStream.locale)
             iframes.add(label to it)
         }
+        if (mainIframe != null && mainIframe.contains("?") && !mainUri.isNullOrBlank()) {
+            normalizeIframeUrl(null, mainUri)?.let { cleanUrl ->
+                if (cleanUrl != mainIframe) {
+                    val label = buildStreamLabel(fullStream.source_tag ?: "Main", fullStream.locale)
+                    iframes.add("$label (Direct)" to cleanUrl)
+                }
+            }
+        }
 
         fullStream.substreams?.forEach { sub ->
             normalizeIframeUrl(sub.iframe, sub.uri_name)?.let {
                 val label = buildStreamLabel(sub.source_tag ?: sub.name ?: "Substream", sub.locale)
                 iframes.add(label to it)
+            }
+            if (sub.iframe != null && sub.iframe.contains("?") && !sub.uri_name.isNullOrBlank()) {
+                normalizeIframeUrl(null, sub.uri_name)?.let { cleanUrl ->
+                    if (cleanUrl != sub.iframe) {
+                        val label = buildStreamLabel(sub.source_tag ?: sub.name ?: "Substream", sub.locale)
+                        iframes.add("$label (Direct)" to cleanUrl)
+                    }
+                }
             }
         }
 
