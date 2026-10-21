@@ -14,7 +14,6 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
 
 data class StreamfreeStream(
     @JsonProperty("name") val name: String? = null,
@@ -23,8 +22,16 @@ data class StreamfreeStream(
     @JsonProperty("stream_key") val streamKey: String? = null,
     @JsonProperty("match_timestamp") val matchTimestamp: Long? = null,
     @JsonProperty("embed_url") val embedUrl: String? = null,
+    @JsonProperty("sources") val sources: List<String>? = null,
     @JsonProperty("thumbnail_url") val thumbnailUrl: String? = null
-)
+) {
+    fun allEmbeds(): List<String> {
+        val list = mutableListOf<String>()
+        sources?.forEach { s -> if (s.isNotBlank()) list.add(s) }
+        if (!embedUrl.isNullOrBlank() && embedUrl !in list) list.add(embedUrl)
+        return list
+    }
+}
 
 data class StreamfreeResponse(
     @JsonProperty("count") val count: Int? = null,
@@ -39,10 +46,13 @@ data class StreamfreeToken(
 
 object StreamfreeSource {
     private const val streamfreeUrl = "https://streamfree.top"
+    private val regex0x = Regex("""const\s+_0x\s*=\s*(\{.*?\});""")
+    private val regexSourceSuffix = Regex("""const\s+SOURCE_SUFFIX\s*=\s*['"]([^'"]*)['"]""")
+    private val regexVariant = Regex("""const\s+VARIANT\s*=\s*['"]([^'"]+)['"]\s*\+\s*QUALITY""")
 
     suspend fun fetchStreamfreeStreams(): List<StreamfreeStream> = CstrspCache.cached("streamfree") {
         app.get("$streamfreeUrl/api/v1/streams").parsedSafe<StreamfreeResponse>()?.streams
-            ?.filter { !it.name.isNullOrBlank() && !it.embedUrl.isNullOrBlank() }
+            ?.filter { !it.name.isNullOrBlank() && it.allEmbeds().isNotEmpty() }
     } ?: emptyList()
 
     fun streamfreeItem(api: MainAPI, stream: StreamfreeStream): SearchResponse =
@@ -88,65 +98,83 @@ object StreamfreeSource {
             return false
         }
 
-        if (stream.embedUrl.isNullOrBlank()) return false
+        val embeds = stream.allEmbeds()
+        if (embeds.isEmpty()) return false
 
-        val embedUrl = stream.embedUrl
-        val refererUrl = "$streamfreeUrl/${stream.category ?: "live"}/${stream.streamKey ?: ""}"
-        val embedHtml = try {
-            app.get(embedUrl, referer = refererUrl).text
-        } catch (e: Exception) { null }
+        val category = stream.category ?: "live"
+        val streamKey = stream.streamKey ?: ""
+        val refererUrl = "$streamfreeUrl/$category/$streamKey"
 
-        var foundDirect = false
-        if (embedHtml != null) {
-            val m0x = Regex("""const\s+_0x\s*=\s*(\{.*?\});""").find(embedHtml)
-            if (m0x != null) {
-                try {
-                    val qMap = AppUtils.parseJson<Map<String, StreamfreeToken>>(m0x.groupValues[1])
-                    if (qMap != null) {
-                        for ((q, params) in qMap) {
-                            val t = params.t ?: continue
-                            val e = params.e ?: continue
-                            val n = params.n ?: continue
-                            val directUrl = "$streamfreeUrl/live/${stream.streamKey}$q/index.m3u8?_t=$t&_e=$e&_n=$n"
-                            val quality = when (q.lowercase()) {
-                                "2160p", "4k" -> Qualities.P2160.value
-                                "1080p" -> Qualities.P1080.value
-                                "720p" -> Qualities.P720.value
-                                "540p" -> Qualities.P480.value
-                                else -> Qualities.Unknown.value
-                            }
-                            val labeled = withQualityLabel("StreamFree - $q", quality)
-                            callback.invoke(
-                                ExtractorLink(
-                                    source = "StreamFree",
-                                    name = labeled,
-                                    url = directUrl,
-                                    referer = "$streamfreeUrl/",
-                                    quality = quality,
-                                    type = ExtractorLinkType.M3U8
-                                )
-                            )
-                            foundDirect = true
-                        }
-                    }
-                } catch (e: Exception) {}
+        embeds.resolveConcurrently { embedUrl ->
+            val embedUri = runCatching { java.net.URI(embedUrl) }.getOrNull()
+            val embedOrigin = if (embedUri != null && embedUri.host != null) {
+                "${embedUri.scheme ?: "https"}://${embedUri.authority}"
+            } else {
+                streamfreeUrl
             }
-        }
 
-        if (!foundDirect) {
-            loadExtractor(encodeUrlNonAscii(embedUrl), refererUrl, subtitleCallback) { link ->
-                callback(
-                    ExtractorLink(
-                        source = "StreamFree",
-                        name = withQualityLabel("StreamFree - ${stream.name}", link.quality),
-                        url = link.url,
-                        referer = link.referer,
-                        quality = link.quality,
-                        type = link.type,
-                        headers = link.headers,
-                        extractorData = link.extractorData
+            val embedHtml = try {
+                app.get(embedUrl, referer = refererUrl).text
+            } catch (e: Exception) {
+                null
+            }
+
+            var foundDirect = false
+            if (embedHtml != null) {
+                val m0x = regex0x.find(embedHtml)
+                if (m0x != null) {
+                    try {
+                        val qMap = AppUtils.parseJson<Map<String, StreamfreeToken>>(m0x.groupValues[1])
+                        if (!qMap.isNullOrEmpty()) {
+                            val suffix = regexSourceSuffix.find(embedHtml)?.groupValues?.get(1) ?: ""
+                            val variantKey = regexVariant.find(embedHtml)?.groupValues?.get(1)?.ifBlank { streamKey } ?: streamKey
+
+                            for ((q, params) in qMap) {
+                                val t = params.t ?: continue
+                                val e = params.e ?: continue
+                                val n = params.n ?: continue
+                                val directUrl = "$embedOrigin/live/$variantKey$q$suffix/index.m3u8?_t=$t&_e=$e&_n=$n"
+                                val quality = when (q.lowercase()) {
+                                    "2160p", "4k" -> Qualities.P2160.value
+                                    "1080p" -> Qualities.P1080.value
+                                    "720p" -> Qualities.P720.value
+                                    "540p" -> Qualities.P480.value
+                                    else -> Qualities.Unknown.value
+                                }
+                                val labeled = withQualityLabel("StreamFree - $q", quality)
+                                callback.invoke(
+                                    ExtractorLink(
+                                        source = "StreamFree",
+                                        name = labeled,
+                                        url = directUrl,
+                                        referer = "$embedOrigin/",
+                                        quality = quality,
+                                        type = ExtractorLinkType.M3U8,
+                                        headers = mapOf("Origin" to embedOrigin)
+                                    )
+                                )
+                                foundDirect = true
+                            }
+                        }
+                    } catch (e: Exception) {}
+                }
+            }
+
+            if (!foundDirect) {
+                loadEmbed(embedUrl, refererUrl, subtitleCallback) { link ->
+                    callback(
+                        ExtractorLink(
+                            source = "StreamFree",
+                            name = withQualityLabel("StreamFree - ${stream.name}", link.quality),
+                            url = link.url,
+                            referer = link.referer,
+                            quality = link.quality,
+                            type = link.type,
+                            headers = link.headers,
+                            extractorData = link.extractorData
+                        )
                     )
-                )
+                }
             }
         }
         return true

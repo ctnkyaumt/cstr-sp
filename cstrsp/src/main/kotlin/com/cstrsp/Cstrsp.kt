@@ -25,9 +25,11 @@ class Cstrsp : MainAPI() {
                 async { safeList { StreamedSource.getHomeSections(this@Cstrsp) } },
                 async { safeList { StreamfreeSource.getHomeSections(this@Cstrsp) } },
                 async { safeList { PpvSource.getHomeSections(this@Cstrsp) } },
-                async { safeList { WatchFootySource.getHomeSections(this@Cstrsp) } },
                 async { safeList { StreamSportsSource.getHomeSections(this@Cstrsp) } },
-                async { safeList { RoxieSourceProvider.getHomeSections(this@Cstrsp) } }
+                async { safeList { RoxieSourceProvider.getHomeSections(this@Cstrsp) } },
+                async { safeList { TimStreamsSource.getHomeSections(this@Cstrsp) } },
+                async { safeList { ZliveSource.getHomeSections(this@Cstrsp) } },
+                async { safeList { StreamCornerSource.getHomeSections(this@Cstrsp) } }
             ).awaitAll()
         }.flatten()
         return newHomePageResponse(sections)
@@ -45,9 +47,11 @@ class Cstrsp : MainAPI() {
                 async { safeList { StreamedSource.search(this@Cstrsp, matcher) } },
                 async { safeList { StreamfreeSource.search(this@Cstrsp, matcher) } },
                 async { safeList { PpvSource.search(this@Cstrsp, matcher) } },
-                async { safeList { WatchFootySource.search(this@Cstrsp, matcher) } },
                 async { safeList { StreamSportsSource.search(this@Cstrsp, matcher) } },
-                async { safeList { RoxieSourceProvider.search(this@Cstrsp, matcher) } }
+                async { safeList { RoxieSourceProvider.search(this@Cstrsp, matcher) } },
+                async { safeList { TimStreamsSource.search(this@Cstrsp, matcher) } },
+                async { safeList { ZliveSource.search(this@Cstrsp, matcher) } },
+                async { safeList { StreamCornerSource.search(this@Cstrsp, matcher) } }
             ).awaitAll()
         }.forEach { results.addAll(it) }
 
@@ -59,9 +63,11 @@ class Cstrsp : MainAPI() {
         TrtSource.load(this, url)?.let { return it }
         StreamfreeSource.load(this, url)?.let { return it }
         PpvSource.load(this, url)?.let { return it }
-        WatchFootySource.load(this, url)?.let { return it }
         StreamSportsSource.load(this, url)?.let { return it }
         RoxieSourceProvider.load(this, url)?.let { return it }
+        TimStreamsSource.load(this, url)?.let { return it }
+        ZliveSource.load(this, url)?.let { return it }
+        StreamCornerSource.load(this, url)?.let { return it }
         return StreamedSource.load(this, url)
     }
 
@@ -75,9 +81,12 @@ class Cstrsp : MainAPI() {
         if (TrtSource.loadLinks(data, callback)) return true
         if (StreamfreeSource.loadLinks(data, subtitleCallback, callback)) return true
         if (PpvSource.loadLinks(data, subtitleCallback, callback)) return true
-        if (WatchFootySource.loadLinks(data, subtitleCallback, callback)) return true
         if (StreamSportsSource.loadLinks(data, subtitleCallback, callback)) return true
         if (RoxieSourceProvider.loadLinks(data, subtitleCallback, callback)) return true
+        if (TimStreamsSource.loadLinks(data, subtitleCallback, callback)) return true
+        // StreamCorner before zlive: its {provider,id,name} data would also parse as zlive's {id,name}
+        if (StreamCornerSource.loadLinks(data, subtitleCallback, callback)) return true
+        if (ZliveSource.loadLinks(data, subtitleCallback, callback)) return true
         return StreamedSource.loadLinks(data, subtitleCallback, callback)
     }
 }

@@ -107,9 +107,12 @@ open class CstrspExtractor(override val mainUrl: String, private val context: Co
                         if (scheme != null && scheme != "http" && scheme != "https") return true
 
                         if (request?.isForMainFrame == true) {
-                            val requested = request.url.toString().substringBefore('#')
-                            val initial = url.substringBefore('#')
-                            if (requested != initial) return true
+                            val isRedirect = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N && request.isRedirect
+                            if (!isRedirect) {
+                                val requested = request.url.toString().substringBefore('#')
+                                val initial = url.substringBefore('#')
+                                if (requested != initial) return true
+                            }
                         }
                         return false
                     }

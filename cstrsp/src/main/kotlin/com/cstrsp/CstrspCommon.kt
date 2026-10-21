@@ -1,5 +1,10 @@
 package com.cstrsp
 
+import android.content.Context
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.loadExtractor
+
 import com.lagradost.cloudstream3.utils.Qualities
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -8,6 +13,33 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+
+object CstrspContext {
+    @Volatile var appContext: Context? = null
+}
+
+suspend fun loadEmbed(
+    url: String,
+    referer: String?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit
+): Boolean {
+    val cleanUrl = encodeUrlNonAscii(url)
+    if (loadExtractor(cleanUrl, referer, subtitleCallback, callback)) {
+        return true
+    }
+    val ctx = CstrspContext.appContext ?: return false
+    return try {
+        val uri = java.net.URI(cleanUrl)
+        val scheme = uri.scheme ?: "https"
+        val host = uri.host ?: return false
+        val base = "$scheme://$host/"
+        CstrspExtractor(base, ctx).getUrl(cleanUrl, referer, subtitleCallback, callback)
+        true
+    } catch (e: Exception) {
+        false
+    }
+}
 
 object CstrspCache {
     private const val CACHE_TTL_MS = 30_000L

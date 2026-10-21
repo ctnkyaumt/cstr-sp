@@ -15,7 +15,6 @@ import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newDrmExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
@@ -39,14 +38,16 @@ data class RoxieSource(
 
 data class RoxiePage(
     val sources: List<RoxieSource>,
-    val domainsFile: String
+    val domainsFile: String,
+    val fallbackDomain: String = "shadow-ran.online"
 )
 
 data class RoxieLoadData(
     @JsonProperty("name") val name: String,
     @JsonProperty("path") val path: String,
     @JsonProperty("sources") val sources: List<RoxieSource>,
-    @JsonProperty("domainsFile") val domainsFile: String = "domainsz58.txt"
+    @JsonProperty("domainsFile") val domainsFile: String = "domainsz58.txt",
+    @JsonProperty("fallbackDomain") val fallbackDomain: String = "shadow-ran.online"
 )
 
 object RoxieSourceProvider {
@@ -61,6 +62,8 @@ object RoxieSourceProvider {
     private val roxieRawRegex = Regex("playIframePlayer\\(\\s*'([^']+)'\\s*\\)")
     private val roxieTagRegex = Regex("<[^>]+>")
     private val roxieDomainsFileRegex = Regex("domainsz\\d+\\.txt")
+    private val roxieSubdomainRegex = Regex("""getRandomStream\(\s*\w+\s*,\s*\w+\s*=\s*'([^']+)'""")
+    private val roxieFallbackDomainRegex = Regex("""https://\$\{subdomain\}\.([a-z0-9.-]+)/""")
     private val roxieLoadCallRegex = Regex("\\.load\\(\\s*[\"']([^\"']+)[\"']")
     private val roxieManifestRegex = Regex("https?://[^\\s\"'<>]+\\.(?:mpd|m3u8)[^\\s\"'<>]*")
     private val roxieClearKeyRegex = Regex("[\"']([0-9a-fA-F]{32})[\"']\\s*:\\s*[\"']([0-9a-fA-F]{32})[\"']")
@@ -100,11 +103,12 @@ object RoxieSourceProvider {
         onclick: String,
         label: String,
         html: String,
+        defaultSubdomain: String = "admin2",
         nested: Boolean = false
     ): List<RoxieSource> {
         val out = mutableListOf<RoxieSource>()
         roxieGetStreamRegex.findAll(onclick).forEach {
-            out.add(RoxieSource(label, "m3u8", it.groupValues[1], it.groupValues[2].ifBlank { "ataide0" }))
+            out.add(RoxieSource(label, "m3u8", it.groupValues[1], it.groupValues[2].ifBlank { defaultSubdomain }))
         }
         roxieRawRegex.findAll(onclick).forEach {
             out.add(RoxieSource(label, "raw", it.groupValues[1]))
@@ -112,7 +116,7 @@ object RoxieSourceProvider {
         if (out.isEmpty() && !nested) {
             roxieFnCallRegex.find(onclick)?.groupValues?.get(1)?.let { fn ->
                 jsFunctionBody(html, fn)?.let { body ->
-                    out.addAll(roxieSourcesFrom(body, label, html, nested = true))
+                    out.addAll(roxieSourcesFrom(body, label, html, defaultSubdomain, nested = true))
                 }
             }
         }
@@ -185,14 +189,16 @@ object RoxieSourceProvider {
 
     suspend fun fetchRoxiePage(path: String): RoxiePage = CstrspCache.cached("roxie-page-$path") {
         val html = app.get("$roxieUrl$path", referer = "$roxieUrl/").text
+        val defaultSubdomain = roxieSubdomainRegex.find(html)?.groupValues?.get(1)?.ifBlank { "admin2" } ?: "admin2"
+        val fallbackDomain = roxieFallbackDomainRegex.find(html)?.groupValues?.get(1)?.ifBlank { "shadow-ran.online" } ?: "shadow-ran.online"
         val sources = roxieButtonRegex.findAll(html).flatMap { m ->
             val onclick = m.groupValues[1]
             val label = roxieTagRegex.replace(m.groupValues[2], "").trim().ifBlank { "Stream" }
-            roxieSourcesFrom(onclick, label, html).asSequence()
+            roxieSourcesFrom(onclick, label, html, defaultSubdomain).asSequence()
         }.distinctBy { "${it.kind}|${it.value}|${it.subdomain}" }.toList()
         val domainsFile = roxieDomainsFileRegex.find(html)?.value ?: "domainsz58.txt"
-        RoxiePage(sources, domainsFile).takeIf { sources.isNotEmpty() }
-    } ?: RoxiePage(emptyList(), "domainsz58.txt")
+        RoxiePage(sources, domainsFile, fallbackDomain).takeIf { sources.isNotEmpty() }
+    } ?: RoxiePage(emptyList(), "domainsz58.txt", "shadow-ran.online")
 
     suspend fun fetchPlayableRoxieEvents(): List<RoxieEvent> = CstrspCache.cached("roxie-playable-events") {
         val events = fetchRoxieEvents()
@@ -207,7 +213,7 @@ object RoxieSourceProvider {
                             page.sources.isEmpty() -> null
                             page.sources.any { it.kind == "raw" } -> event
                             else -> {
-                                val domains = fetchRoxieDomains(page.domainsFile)
+                                val domains = fetchRoxieDomains(page.domainsFile).ifEmpty { listOf(page.fallbackDomain) }
                                 val playable = withTimeoutOrNull(ROXIE_LIST_PROBE_TIMEOUT_MS) {
                                     page.sources.asSequence()
                                         .filter { it.kind == "m3u8" }
@@ -255,7 +261,7 @@ object RoxieSourceProvider {
         return api.newLiveStreamLoadResponse(
             name = "$name [Roxie]",
             url = url,
-            dataUrl = RoxieLoadData(name, path, page.sources, page.domainsFile).toJson()
+            dataUrl = RoxieLoadData(name, path, page.sources, page.domainsFile, page.fallbackDomain).toJson()
         ) {
             this.plot = name
         }
@@ -273,7 +279,7 @@ object RoxieSourceProvider {
         }
 
         if (load.path.isNotBlank() && load.sources.isNotEmpty()) {
-            val domains = fetchRoxieDomains(load.domainsFile)
+            val domains = fetchRoxieDomains(load.domainsFile).ifEmpty { listOf(load.fallbackDomain) }
             val eventRef = "$roxieUrl${load.path}"
             load.sources.resolveConcurrently { src ->
                 if (src.kind == "raw") {
@@ -282,7 +288,7 @@ object RoxieSourceProvider {
                     val manifest = roxieLoadCallRegex.find(page)?.groupValues?.get(1)
                         ?: roxieManifestRegex.find(page)?.value
                     if (manifest == null) {
-                        loadExtractor(rawUrl, eventRef, subtitleCallback) { link ->
+                        loadEmbed(rawUrl, eventRef, subtitleCallback) { link ->
                             callback(
                                 ExtractorLink(
                                     source = "Roxie",

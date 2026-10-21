@@ -13,7 +13,6 @@ import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
@@ -67,7 +66,7 @@ object StreamedSource {
     private const val DOMAIN_PROBE_TIMEOUT_MS = 6_000L
 
     private val domains = listOf(
-        "https://streamed.pk", "https://streamed.st", "https://streamed.is", "https://streamed.to", "https://streamed.cx"
+        "https://streamed.pk", "https://streamed.st"
     )
 
     fun streamedApiCandidates(endpoint: String): List<String> {
@@ -255,7 +254,7 @@ object StreamedSource {
             val sourceName = source.source?.replaceFirstChar { it.uppercase() } ?: "Unknown"
             val hdTag = if (stream.hd) " [HD]" else " [SD]"
             val base = "$sourceName - $langStr - Stream ${stream.streamNo ?: "?"}$hdTag"
-            loadExtractor(encodeUrlNonAscii(stream.embedUrl!!), "$mainUrl/", subtitleCallback) { link ->
+            loadEmbed(encodeUrlNonAscii(stream.embedUrl!!), "$mainUrl/", subtitleCallback) { link ->
                 val resolvedQuality = when {
                     link.quality != Qualities.Unknown.value -> link.quality
                     stream.hd -> Qualities.P1080.value

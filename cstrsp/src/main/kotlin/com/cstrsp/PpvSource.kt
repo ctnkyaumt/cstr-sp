@@ -12,7 +12,6 @@ import com.lagradost.cloudstream3.newLiveStreamLoadResponse
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.loadExtractor
 
 data class PPVSourceItem(
     @JsonProperty("name") val name: String? = null,
@@ -64,7 +63,7 @@ data class PPVResponse(
 
 object PpvSource {
     private const val PPV_BASE = "https://ppv.st"
-    private val ppvDomains = listOf("api.ppv.st", "api.ppv.cx", "api.ppv.lc", "api.ppv.to", "api.ppv.is")
+    private val ppvDomains = listOf("api.ppv.st", "api.ppv.tj", "api.ppvs.pk", "api.ppv.rw", "api.ppv.ms", "api.ppv.bi", "api.ppv.ug")
 
     suspend fun fetchPPVApi(): PPVResponse? = CstrspCache.cached("ppv") {
         ppvDomains.firstNotNullOfOrNull { domain ->
@@ -233,7 +232,7 @@ object PpvSource {
         if (iframes.isEmpty()) return false
 
         iframes.distinctBy { it.second }.resolveConcurrently { (name, iframeUrl) ->
-            loadExtractor(encodeUrlNonAscii(iframeUrl), "$PPV_BASE/", subtitleCallback) { link ->
+            loadEmbed(encodeUrlNonAscii(iframeUrl), "$PPV_BASE/", subtitleCallback) { link ->
                 callback(
                     ExtractorLink(
                         source = "PPV",

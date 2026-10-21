@@ -14,7 +14,6 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
 
 data class CdnChannel(
     @JsonProperty("channel_name") val channelName: String? = null,
@@ -30,6 +29,8 @@ data class CdnEvent(
     @JsonProperty("homeTeamIMG") val homeTeamImg: String? = null,
     @JsonProperty("eventIMG") val eventImg: String? = null,
     @JsonProperty("status") val status: String? = null,
+    @JsonProperty("start") val start: String? = null,
+    @JsonProperty("end") val end: String? = null,
     @JsonProperty("channels") val channels: List<CdnChannel>? = null
 )
 
@@ -55,9 +56,37 @@ object StreamSportsSource {
         "abd", "abandoned", "susp", "suspended", "wo", "awd", "ft", "aet", "pen", "fin", "finished", "ended"
     )
 
+    private fun parseUtcDate(dateStr: String?): Long? {
+        if (dateStr.isNullOrBlank()) return null
+        return try {
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).apply {
+                timeZone = java.util.TimeZone.getTimeZone("UTC")
+            }
+            sdf.parse(dateStr.trim())?.time
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun isLiveCdn(event: CdnEvent): Boolean {
-        val s = event.status?.trim()?.lowercase() ?: return true
-        return s.isEmpty() || s !in cdnNotLiveStatuses
+        val s = event.status?.trim()?.lowercase() ?: ""
+        if (s.isNotEmpty() && s in cdnNotLiveStatuses) return false
+
+        val startTime = parseUtcDate(event.start)
+        if (startTime == null) {
+            return s.isEmpty() || s !in cdnNotLiveStatuses
+        }
+
+        val now = System.currentTimeMillis()
+        val fifteenMinMs = 15 * 60 * 1000L
+        val thirtyMinMs = 30 * 60 * 1000L
+
+        if (now < startTime - fifteenMinMs) return false
+
+        val endTime = parseUtcDate(event.end)
+        if (endTime != null && now > endTime + thirtyMinMs) return false
+
+        return true
     }
 
     fun cdnTitle(event: CdnEvent): String =
@@ -197,7 +226,7 @@ object StreamSportsSource {
                         )
                     )
                 } else {
-                    loadExtractor(channel.url!!, "https://cdnlivetv.tv/", subtitleCallback) { link ->
+                    loadEmbed(channel.url!!, "https://cdnlivetv.tv/", subtitleCallback) { link ->
                         callback(
                             ExtractorLink(
                                 source = "StreamSports",

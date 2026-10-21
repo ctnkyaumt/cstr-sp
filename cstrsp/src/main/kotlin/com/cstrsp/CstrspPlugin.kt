@@ -7,6 +7,7 @@ import android.content.Context
 @CloudstreamPlugin
 class CstrspPlugin: Plugin() {
     override fun load(context: Context) {
+        CstrspContext.appContext = context.applicationContext ?: context
         registerMainAPI(Cstrsp())
         registerExtractorAPI(CstrspExtractor("https://embed.st/", context))
         registerExtractorAPI(CstrspExtractor("https://embedme.top/", context))
@@ -17,5 +18,6 @@ class CstrspPlugin: Plugin() {
         registerExtractorAPI(CstrspExtractor("https://roxiestreams.su/", context))
         registerExtractorAPI(CstrspExtractor("https://streamfree.top/", context))
         registerExtractorAPI(CstrspExtractor("https://spiderembed.top/", context))
+        registerExtractorAPI(CstrspExtractor("https://zlive.st/", context))
     }
 }
